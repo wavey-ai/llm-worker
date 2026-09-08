@@ -3,8 +3,8 @@
 Local LLM inference, and a worker that serves it over HTTP.
 
 ```
-llm-engine/            the engine. Owns the model, the context, sampling. No HTTP.
-llm-worker/     the adapter. Claims work from the upload-response ring and
+llm-engine/      the engine. Owns the model, the context, sampling. No HTTP.
+llm-worker/      the adapter. Claims work from the upload-response ring and
                  answers it in the OpenAI chat-completions format.
 examples/serve/  an ingress, for trying it out without a second service.
 ```
@@ -14,6 +14,10 @@ nothing that speaks HTTP. The worker reaches a ring over HTTP but never serves
 it: no server crate, no listening socket, which is what lets the same code run
 against a remote ring and an in-process one. The example is the only place a
 port is opened.
+
+The model comes from the Hugging Face cache, downloaded on first use and
+shared with everything else on the machine that pulls from it. `--model`
+takes a GGUF file directly if you would rather not.
 
 ## The engine
 
@@ -41,7 +45,7 @@ There is a CLI over the same interface a worker uses:
 
 ```
 cargo run -p llm-engine -- --prompt "Say hi." --max-tokens 64
-cargo run -p llm-engine -- --model models/model.gguf --system "Be brief." --think
+cargo run -p llm-engine -- --system "Be brief." --think
 ```
 
 ## The worker
@@ -53,7 +57,6 @@ The GPU is here; the front door is elsewhere:
 
 ```
 llm-worker \
-  --model models/Qwen3.5-0.8B-Q4_K_M.gguf \
   --ingress-url https://ingress-a:8443 \
   --ingress-url https://ingress-b:8443
 ```
@@ -65,9 +68,7 @@ page in one process, over an in-process ring, so one binary is enough to try
 the thing out. Everything the server crate touches lives there.
 
 ```
-cargo run -p llm-serve -- \
-  --model models/Qwen3.5-0.8B-Q4_K_M.gguf \
-  --tls-cert cert.pem --tls-key key.pem
+cargo run -p llm-serve -- --tls-cert cert.pem --tls-key key.pem
 ```
 
 Then open <https://localhost:8443/> — a self-signed certificate means the

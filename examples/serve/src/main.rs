@@ -5,7 +5,7 @@
 //! so one binary is enough to try the thing out:
 //!
 //! ```text
-//! llm-serve --model models/model.gguf --tls-cert cert.pem --tls-key key.pem
+//! llm-serve --tls-cert cert.pem --tls-key key.pem
 //! ```
 //!
 //! Everything the server crate touches lives here rather than in the worker
