@@ -161,6 +161,9 @@ pub enum Stop {
     EndOfGeneration,
     /// `max_tokens` was reached.
     Limit,
+    /// The context window filled. Generation cannot continue without
+    /// discarding history, which is a decision for the caller, not the engine.
+    ContextFull,
     /// The caller cancelled, or dropped the `Generation`.
     Cancelled,
 }
@@ -460,6 +463,15 @@ impl Runtime {
             .str_to_token(&prompt, AddBos::Always)
             .context("failed to tokenize the prompt")?;
 
+        // A prompt that does not fit cannot be decoded at all, and the error
+        // llama.cpp gives for it says nothing about why.
+        anyhow::ensure!(
+            (tokens.len() as u32) < self.n_ctx,
+            "prompt is {} tokens and the context is {}",
+            tokens.len(),
+            self.n_ctx
+        );
+
         let prefill = info_span!("prefill", prompt_tokens = tokens.len()).entered();
         let started = ggml_time_us();
         let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
@@ -491,12 +503,16 @@ impl Runtime {
         // partial bytes until they form one.
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut n_cur = batch.n_tokens();
-        let n_limit = n_cur + job.request.max_tokens;
+        // Decoding past the context window fails inside llama.cpp with a
+        // memory-slot error, mid-sentence. Stop at the edge and say so.
+        let room = self.n_ctx as i32 - n_cur;
+        let n_limit = n_cur + job.request.max_tokens.min(room);
+        let context_bound = job.request.max_tokens > room;
         let mut n_decoded: u32 = 0;
 
         let generate = info_span!("generate", max_tokens = job.request.max_tokens).entered();
         let started = ggml_time_us();
-        let mut stop = Stop::Limit;
+        let mut stop = if context_bound { Stop::ContextFull } else { Stop::Limit };
 
         while n_cur < n_limit {
             if job.cancel.load(Ordering::Acquire) {

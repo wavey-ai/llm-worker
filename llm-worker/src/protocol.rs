@@ -179,7 +179,7 @@ impl ChatRequest {
 pub fn finish_reason(stop: Stop) -> &'static str {
     match stop {
         Stop::EndOfGeneration => "stop",
-        Stop::Limit => "length",
+        Stop::Limit | Stop::ContextFull => "length",
         Stop::Cancelled => "stop",
     }
 }

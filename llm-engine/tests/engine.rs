@@ -56,6 +56,47 @@ async fn stops_at_the_token_limit() {
     assert_eq!(stop, Stop::Limit);
 }
 
+/// Asking for more tokens than the context can hold must end the generation,
+/// not fail it: llama.cpp's own error for decoding past the window arrives
+/// mid-sentence and says nothing useful.
+#[tokio::test(flavor = "multi_thread")]
+async fn stops_at_the_edge_of_the_context() {
+    let engine = Engine::spawn(EngineConfig {
+        n_ctx: 512,
+        native_logs: false,
+        ..EngineConfig::default()
+    })
+    .expect("engine failed to start");
+
+    let mut generation = engine
+        .submit(ask("Count from 1 upward, one number per line, forever.", 4000))
+        .unwrap();
+    let (text, stop) = drain(&mut generation).await;
+
+    assert_eq!(stop, Stop::ContextFull);
+    assert!(!text.is_empty());
+}
+
+/// A prompt too long to decode should say that, rather than failing somewhere
+/// inside the first forward pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn rejects_a_prompt_larger_than_the_context() {
+    let engine = Engine::spawn(EngineConfig {
+        n_ctx: 64,
+        native_logs: false,
+        ..EngineConfig::default()
+    })
+    .expect("engine failed to start");
+
+    let mut generation = engine.submit(ask(&"word ".repeat(200), 16)).unwrap();
+    match generation.recv().await.expect("stream ended early") {
+        Event::Failed(error) => {
+            assert!(error.contains("context"), "unhelpful error: {error}");
+        }
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_cancel_stops_generation() {
     let engine = engine();
