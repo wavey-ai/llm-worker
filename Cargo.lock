@@ -134,7 +134,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "av-upload-response"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?branch=main#39038c87306d0e04ea2e337f455e641926e7f48b"
+source = "git+https://github.com/wavey-ai/web-services.git?branch=main#af3f88465e68e54a72b782292b49947f38270e23"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -164,7 +164,7 @@ dependencies = [
 [[package]]
 name = "av-web-service"
 version = "0.1.0"
-source = "git+https://github.com/wavey-ai/web-services.git?branch=main#39038c87306d0e04ea2e337f455e641926e7f48b"
+source = "git+https://github.com/wavey-ai/web-services.git?branch=main#af3f88465e68e54a72b782292b49947f38270e23"
 dependencies = [
  "anyhow",
  "async-trait",
