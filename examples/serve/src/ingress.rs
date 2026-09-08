@@ -79,6 +79,7 @@ impl AppRouter {
                 "n_params": info.n_params,
                 "n_ctx": info.n_ctx,
                 "inflight": capacity.inflight,
+                "decoding": capacity.decoding,
                 "max_inflight": capacity.max_inflight,
                 "available_slots": capacity.available_slots,
             })

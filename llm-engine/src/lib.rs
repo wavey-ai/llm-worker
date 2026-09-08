@@ -81,6 +81,13 @@ pub struct EngineConfig {
     /// engine full. Backpressure of last resort: a caller with a queue of its
     /// own should be reading `capacity()` long before this bites.
     pub queue_depth: usize,
+    /// Hold a decode step to about this long by decoding fewer requests at
+    /// once, whatever `max_inflight` allows. Every sequence in a batch pays
+    /// for every other one, so this is the knob that decides what a single
+    /// caller sees: a step of 100ms is ten tokens a second, each.
+    ///
+    /// Zero leaves admission to `max_inflight` alone.
+    pub target_step_ms: u64,
     /// Route llama.cpp's own logs into `tracing` under the `llama-cpp-2` target.
     pub native_logs: bool,
 }
@@ -96,6 +103,7 @@ impl Default for EngineConfig {
             n_gpu_layers: 99,
             max_inflight: 1,
             queue_depth: 32,
+            target_step_ms: 0,
             native_logs: true,
         }
     }
@@ -189,7 +197,11 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Capacity {
+    /// Submitted and not yet finished, whether or not it has reached the GPU.
     pub inflight: usize,
+    /// Actually in the batch. Below `inflight` when admission is holding
+    /// requests back to keep steps short.
+    pub decoding: usize,
     pub max_inflight: usize,
     pub available_slots: usize,
 }
@@ -215,10 +227,17 @@ pub struct Engine {
     inner: Arc<Inner>,
 }
 
+/// What the engine thread publishes about itself, read by `capacity()`.
+#[derive(Clone, Default)]
+struct Meters {
+    inflight: Arc<AtomicUsize>,
+    decoding: Arc<AtomicUsize>,
+}
+
 struct Inner {
     jobs: Option<mpsc::Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    inflight: Arc<AtomicUsize>,
+    meters: Meters,
     max_inflight: usize,
     info: ModelInfo,
 }
@@ -245,12 +264,12 @@ impl Engine {
         let queue_depth = config.queue_depth.max(max_inflight);
         let (jobs_tx, jobs_rx) = mpsc::channel::<Job>(queue_depth);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<ModelInfo>>();
-        let inflight = Arc::new(AtomicUsize::new(0));
+        let meters = Meters::default();
 
-        let thread_inflight = inflight.clone();
+        let thread_meters = meters.clone();
         let thread = std::thread::Builder::new()
             .name("llm-engine".to_string())
-            .spawn(move || engine_thread(config, jobs_rx, ready_tx, thread_inflight))
+            .spawn(move || engine_thread(config, jobs_rx, ready_tx, thread_meters))
             .context("failed to start the engine thread")?;
 
         let info = ready_rx
@@ -261,7 +280,7 @@ impl Engine {
             inner: Arc::new(Inner {
                 jobs: Some(jobs_tx),
                 thread: Some(thread),
-                inflight,
+                meters,
                 max_inflight,
                 info,
             }),
@@ -276,9 +295,10 @@ impl Engine {
     /// everything submitted and not yet finished, so a request waiting behind
     /// another shows up as occupancy rather than as free capacity.
     pub fn capacity(&self) -> Capacity {
-        let inflight = self.inner.inflight.load(Ordering::Acquire);
+        let inflight = self.inner.meters.inflight.load(Ordering::Acquire);
         Capacity {
             inflight,
+            decoding: self.inner.meters.decoding.load(Ordering::Acquire),
             max_inflight: self.inner.max_inflight,
             available_slots: self.inner.max_inflight.saturating_sub(inflight),
         }
@@ -303,7 +323,7 @@ impl Engine {
             mpsc::error::TrySendError::Closed(_) => anyhow!("engine has shut down"),
         })?;
 
-        self.inner.inflight.fetch_add(1, Ordering::AcqRel);
+        self.inner.meters.inflight.fetch_add(1, Ordering::AcqRel);
         Ok(Generation { events: events_rx, cancel })
     }
 }
@@ -342,7 +362,7 @@ fn engine_thread(
     config: EngineConfig,
     jobs: mpsc::Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<ModelInfo>>,
-    inflight: Arc<AtomicUsize>,
+    meters: Meters,
 ) {
     send_logs_to_tracing(LogOptions::default().with_logs_enabled(config.native_logs));
 
@@ -358,7 +378,7 @@ fn engine_thread(
     // side in one struct. It lives inside `serve` instead, for exactly as long
     // as the engine does, which also keeps the teardown order right: context,
     // then model, then the backend that outlives both.
-    runtime.serve(jobs, ready, inflight);
+    runtime.serve(jobs, ready, meters);
 }
 
 /// llama.cpp's backend is process-global: `LlamaBackend::init` fails with
@@ -459,6 +479,7 @@ struct Runtime {
     /// slot count.
     n_ctx: u32,
     max_inflight: u32,
+    target_step_us: i64,
 }
 
 impl Runtime {
@@ -494,6 +515,7 @@ impl Runtime {
             info,
             n_ctx: config.n_ctx,
             max_inflight: config.max_inflight.max(1) as u32,
+            target_step_us: config.target_step_ms as i64 * 1_000,
         })
     }
 
@@ -504,7 +526,7 @@ impl Runtime {
         &self,
         mut jobs: mpsc::Receiver<Job>,
         ready: std::sync::mpsc::Sender<Result<ModelInfo>>,
-        inflight: Arc<AtomicUsize>,
+        meters: Meters,
     ) {
         // Context is per slot, so the shared window is the sum. A prefill may
         // be as long as one slot's window, so the batch has to hold that many
@@ -534,39 +556,41 @@ impl Runtime {
             slots = self.max_inflight,
             slot_ctx = self.n_ctx,
             total_ctx,
+            target_step_ms = self.target_step_us / 1_000,
             "engine ready"
         );
 
-        let mut batch = LlamaBatch::new(self.n_ctx.max(512) as usize, self.max_inflight as i32);
-        let mut slots: Vec<Option<Slot>> = (0..self.max_inflight).map(|_| None).collect();
-        // Terminal events for slots that have already given back their
-        // sequence. Kept here so a caller that stopped reading cannot delay
-        // the engine, only its own last message.
-        let mut outbox: Vec<(mpsc::Sender<Event>, Event)> = Vec::new();
+        let mut pool = Pool {
+            slots: (0..self.max_inflight).map(|_| None).collect(),
+            outbox: Vec::new(),
+            batch: LlamaBatch::new(self.n_ctx.max(512) as usize, self.max_inflight as i32),
+            step_us: 0.0,
+        };
         let mut closed = false;
 
         loop {
-            outbox.retain(|(events, event)| {
+            pool.outbox.retain(|(events, event)| {
                 matches!(events.try_send(event.clone()), Err(mpsc::error::TrySendError::Full(_)))
             });
 
-            for index in 0..slots.len() {
-                if let Some(slot) = slots[index].as_mut()
+            for index in 0..pool.slots.len() {
+                if let Some(slot) = pool.slots[index].as_mut()
                     && matches!(slot.flush(), Flush::Abandoned)
                 {
                     warn!(seq_id = slot.seq_id, "caller stopped reading");
-                    self.retire(&mut ctx, &mut slots, index, &inflight, &mut outbox, Stop::Cancelled);
+                    self.retire(&mut ctx, &mut pool, index, &meters, Stop::Cancelled);
                 }
             }
 
-            closed |= self.admit(&mut ctx, &mut slots, &mut jobs, &inflight, &mut outbox, &mut batch);
+            closed |= self.admit(&mut ctx, &mut pool, &mut jobs, &meters);
 
-            let active = slots.iter().flatten().count();
-            if closed && active == 0 && outbox.is_empty() {
+            let active = pool.active();
+            meters.decoding.store(active, Ordering::Release);
+            if closed && active == 0 && pool.outbox.is_empty() {
                 break;
             }
 
-            match self.step(&mut ctx, &mut slots, &inflight, &mut outbox, &mut batch) {
+            match self.step(&mut ctx, &mut pool, &meters) {
                 Step::Decoded => {}
                 // Nothing could be decoded: every slot is waiting on its
                 // caller, or there is no work at all and only the outbox is
@@ -583,17 +607,28 @@ impl Runtime {
     fn admit(
         &self,
         ctx: &mut LlamaContext,
-        slots: &mut [Option<Slot>],
+        pool: &mut Pool<'_>,
         jobs: &mut mpsc::Receiver<Job>,
-        inflight: &Arc<AtomicUsize>,
-        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
-        batch: &mut LlamaBatch,
+        meters: &Meters,
     ) -> bool {
         loop {
-            let Some(index) = slots.iter().position(Option::is_none) else {
+            let Some(index) = pool.slots.iter().position(Option::is_none) else {
                 return false;
             };
-            let idle = slots.iter().all(Option::is_none) && outbox.is_empty();
+            let idle = pool.active() == 0 && pool.outbox.is_empty();
+
+            // Every sequence in a batch slows down every other one, so a
+            // request is worth admitting only while the step it joins stays
+            // inside the target. An idle engine always admits: a queue that
+            // nothing is working on serves nobody.
+            if !idle && self.target_step_us > 0 && pool.step_us >= self.target_step_us as f64 {
+                return false;
+            }
+            // What a step costs is the only signal saying whether to admit
+            // another, and it is a step out of date the moment one joins. So
+            // with a target set, take one and go and measure. Without one,
+            // there is nothing to measure against and a queue is pure loss.
+            let pace = self.target_step_us > 0 && !idle;
 
             let job = if idle {
                 match jobs.blocking_recv() {
@@ -610,8 +645,8 @@ impl Runtime {
 
             if job.cancel.load(Ordering::Acquire) {
                 // Cancelled while queued: never touch the GPU for it.
-                inflight.fetch_sub(1, Ordering::AcqRel);
-                outbox.push((
+                meters.inflight.fetch_sub(1, Ordering::AcqRel);
+                pool.outbox.push((
                     job.events.clone(),
                     Event::Done {
                         stop: Stop::Cancelled,
@@ -624,22 +659,28 @@ impl Runtime {
             }
 
             let seq_id = index as u32;
-            match self.prefill(ctx, batch, job, seq_id) {
-                Ok(Admitted::Running(slot)) => slots[index] = Some(slot),
+            let admitted = self.prefill(ctx, &mut pool.batch, job, seq_id);
+            let running = matches!(admitted, Ok(Admitted::Running(_)));
+            match admitted {
+                Ok(Admitted::Running(slot)) => pool.slots[index] = Some(slot),
                 Ok(Admitted::Finished { job, stop, prompt_tokens, elapsed_ms }) => {
-                    inflight.fetch_sub(1, Ordering::AcqRel);
+                    meters.inflight.fetch_sub(1, Ordering::AcqRel);
                     let _ = ctx.clear_kv_cache_seq(Some(seq_id), None, None);
-                    outbox.push((
+                    pool.outbox.push((
                         job.events.clone(),
                         Event::Done { stop, prompt_tokens, tokens: 0, elapsed_ms },
                     ));
                 }
                 Err((job, err)) => {
                     warn!(error = %err, "generation failed");
-                    inflight.fetch_sub(1, Ordering::AcqRel);
+                    meters.inflight.fetch_sub(1, Ordering::AcqRel);
                     let _ = ctx.clear_kv_cache_seq(Some(seq_id), None, None);
-                    outbox.push((job.events.clone(), Event::Failed(err.to_string())));
+                    pool.outbox.push((job.events.clone(), Event::Failed(err.to_string())));
                 }
+            }
+
+            if pace && running {
+                return false;
             }
         }
     }
@@ -751,33 +792,27 @@ impl Runtime {
     }
 
     /// One decode across every slot that is ready, then one token each.
-    fn step(
-        &self,
-        ctx: &mut LlamaContext,
-        slots: &mut [Option<Slot>],
-        inflight: &Arc<AtomicUsize>,
-        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
-        batch: &mut LlamaBatch,
-    ) -> Step {
-        batch.clear();
+    fn step(&self, ctx: &mut LlamaContext, pool: &mut Pool<'_>, meters: &Meters) -> Step {
+        pool.batch.clear();
         let mut rows: Vec<(usize, i32)> = Vec::new();
 
-        for index in 0..slots.len() {
-            let Some(slot) = slots[index].as_mut() else {
+        for index in 0..pool.slots.len() {
+            let Some(slot) = pool.slots[index].as_mut() else {
                 continue;
             };
             if slot.cancelled() {
-                self.retire(ctx, slots, index, inflight, outbox, Stop::Cancelled);
+                self.retire(ctx, pool, index, meters, Stop::Cancelled);
                 continue;
             }
             if slot.pending.is_some() {
                 continue; // Waiting on its caller, not on the GPU.
             }
 
-            let row = batch.n_tokens();
-            if let Err(err) = batch.add(slot.next_input, slot.n_cur, &[slot.seq_id as i32], true) {
+            let (token, position, seq_id) = (slot.next_input, slot.n_cur, slot.seq_id as i32);
+            let row = pool.batch.n_tokens();
+            if let Err(err) = pool.batch.add(token, position, &[seq_id], true) {
                 let message = err.to_string();
-                self.fail(ctx, slots, index, inflight, outbox, message);
+                self.fail(ctx, pool, index, meters, message);
                 continue;
             }
             rows.push((index, row));
@@ -788,14 +823,14 @@ impl Runtime {
         }
 
         let enqueued = ggml_time_us();
-        let decoded = ctx.decode(batch).context("decode failed");
+        let decoded = ctx.decode(&mut pool.batch).context("decode failed");
         let enqueue_us = ggml_time_us() - enqueued;
         if let Err(err) = decoded {
             // The batch is shared, so a failed decode belongs to every slot in
             // it. None of them can be trusted to continue.
             let message = err.to_string();
             for (index, _) in rows {
-                self.fail(ctx, slots, index, inflight, outbox, message.clone());
+                self.fail(ctx, pool, index, meters, message.clone());
             }
             return Step::Decoded;
         }
@@ -803,7 +838,7 @@ impl Runtime {
         let mut gpu_us = 0i64;
         let mut sampled = 0;
         for (index, row) in rows {
-            let Some(slot) = slots[index].as_mut() else {
+            let Some(slot) = pool.slots[index].as_mut() else {
                 continue;
             };
             slot.n_cur += 1;
@@ -821,7 +856,7 @@ impl Runtime {
             slot.sampler.accept(token);
 
             if self.model.is_eog_token(token) {
-                self.retire(ctx, slots, index, inflight, outbox, Stop::EndOfGeneration);
+                self.retire(ctx, pool, index, meters, Stop::EndOfGeneration);
                 continue;
             }
 
@@ -829,7 +864,7 @@ impl Runtime {
                 Ok(piece) => piece,
                 Err(err) => {
                     let message = err.to_string();
-                    self.fail(ctx, slots, index, inflight, outbox, message);
+                    self.fail(ctx, pool, index, meters, message);
                     continue;
                 }
             };
@@ -843,11 +878,19 @@ impl Runtime {
                 let stop = if slot.context_bound { Stop::ContextFull } else { Stop::Limit };
                 // The slot keeps its pending piece: `retire` hands both it and
                 // the terminal event to the outbox, in order.
-                self.retire(ctx, slots, index, inflight, outbox, stop);
+                self.retire(ctx, pool, index, meters, stop);
             }
         }
 
-        debug!(slots = sampled, enqueue_us, gpu_us, "step");
+        // The GPU wait is the step: the enqueue is nearly free and the work
+        // after it is CPU. Smoothed towards the new reading rather than set
+        // from it, so admission is not steered by one outlier.
+        pool.step_us = if pool.step_us == 0.0 {
+            (enqueue_us + gpu_us) as f64
+        } else {
+            pool.step_us.mul_add(0.7, (enqueue_us + gpu_us) as f64 * 0.3)
+        };
+        debug!(slots = sampled, enqueue_us, gpu_us, step_us = pool.step_us as i64, "step");
         Step::Decoded
     }
 
@@ -859,18 +902,17 @@ impl Runtime {
     fn retire(
         &self,
         ctx: &mut LlamaContext,
-        slots: &mut [Option<Slot>],
+        pool: &mut Pool<'_>,
         index: usize,
-        inflight: &Arc<AtomicUsize>,
-        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
+        meters: &Meters,
         stop: Stop,
     ) {
-        let Some(slot) = slots[index].take() else {
+        let Some(slot) = pool.slots[index].take() else {
             return;
         };
         let elapsed_ms = slot.elapsed_ms();
         let _ = ctx.clear_kv_cache_seq(Some(slot.seq_id), None, None);
-        inflight.fetch_sub(1, Ordering::AcqRel);
+        meters.inflight.fetch_sub(1, Ordering::AcqRel);
 
         info!(
             seq_id = slot.seq_id,
@@ -883,9 +925,9 @@ impl Runtime {
         );
 
         if let Some(pending) = slot.pending {
-            outbox.push((slot.job.events.clone(), pending));
+            pool.outbox.push((slot.job.events.clone(), pending));
         }
-        outbox.push((
+        pool.outbox.push((
             slot.job.events.clone(),
             Event::Done {
                 stop,
@@ -899,19 +941,18 @@ impl Runtime {
     fn fail(
         &self,
         ctx: &mut LlamaContext,
-        slots: &mut [Option<Slot>],
+        pool: &mut Pool<'_>,
         index: usize,
-        inflight: &Arc<AtomicUsize>,
-        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
+        meters: &Meters,
         error: String,
     ) {
-        let Some(slot) = slots[index].take() else {
+        let Some(slot) = pool.slots[index].take() else {
             return;
         };
         warn!(seq_id = slot.seq_id, %error, "generation failed");
         let _ = ctx.clear_kv_cache_seq(Some(slot.seq_id), None, None);
-        inflight.fetch_sub(1, Ordering::AcqRel);
-        outbox.push((slot.job.events.clone(), Event::Failed(error)));
+        meters.inflight.fetch_sub(1, Ordering::AcqRel);
+        pool.outbox.push((slot.job.events.clone(), Event::Failed(error)));
     }
 
     fn build_prompt(&self, request: &GenerateRequest) -> Result<String> {
@@ -949,4 +990,23 @@ enum Admitted {
 enum Step {
     Decoded,
     Idle,
+}
+
+/// Everything the engine loop carries from one step to the next. The context
+/// is not in here: it borrows the model, and the two cannot share a struct.
+struct Pool<'a> {
+    slots: Vec<Option<Slot>>,
+    /// Terminal events for slots that have already given back their sequence.
+    /// Kept apart from the slots so a caller that stopped reading cannot delay
+    /// the engine, only its own last message.
+    outbox: Vec<(mpsc::Sender<Event>, Event)>,
+    batch: LlamaBatch<'a>,
+    /// Smoothed cost of a step, which is what admission is steered by.
+    step_us: f64,
+}
+
+impl Pool<'_> {
+    fn active(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
 }

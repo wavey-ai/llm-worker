@@ -197,6 +197,39 @@ not move is the shape: **capacity is bought with individual latency, and the
 exchange rate gets worse as the batch grows** — 7ms per sequence, every step,
 for every sequence in it.
 
+### Setting a latency target instead
+
+`--max-inflight` is a guess about load. `--target-step-ms` is a statement
+about what a caller should see, which the engine then holds to by admitting
+fewer requests at once. It needs no constants: a step's cost is measured every
+step, and admission stops while that measurement is over the target.
+
+Since every sequence in the batch decodes one token per step, the target *is*
+the per-caller rate: 100ms is ten tokens a second each, whatever the model and
+whatever the hardware.
+
+With 32 slots free and 32 clients arriving at once:
+
+| target | batch used | measured step |
+|--------|------------|---------------|
+| off    | 32         | 207ms |
+| 60ms   | 7          | 64ms  |
+| 100ms  | 10         | 77ms  |
+| 200ms  | 18         | 132ms |
+
+It is a real trade, not a free win. 32 requests over four seconds, median of
+three runs:
+
+| | stream rate | p50 | p95 | aggregate |
+|--|-------------|-----|-----|-----------|
+| no target   | 4.8 tok/s | 8.60s | 9.11s  | 113.2 tok/s |
+| target 60ms | 6.0 tok/s | 6.24s | 11.22s | 86.5 tok/s |
+
+Text appears 25% faster and the median request finishes 27% sooner, paid for
+with 23% on the tail and 24% of the throughput. Which way that trade should go
+is a product question: a person watching an answer appear cares about the
+first two columns, and a batch job cares about the last.
+
 The latency win is unambiguous — everyone starts at once instead of queueing.
 The throughput win is real but smaller than the theory says it should be, and
 `llm_engine=debug` says where it goes:

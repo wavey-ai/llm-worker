@@ -64,6 +64,13 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     max_inflight: usize,
 
+    /// Hold a decode step to about this long, admitting fewer requests at
+    /// once when they would slow each other past it. 100ms is roughly ten
+    /// tokens a second for every caller in the batch. Zero leaves admission
+    /// to --max-inflight.
+    #[arg(long, default_value_t = 0)]
+    target_step_ms: u64,
+
     /// Requests the ring will park at once. Anything beyond this is refused
     /// with a 503 rather than queued, so it wants to be comfortably above the
     /// slot count: the queue is the point of having a ring.
@@ -116,6 +123,7 @@ async fn main() -> Result<()> {
         model,
         n_ctx: args.ctx_size,
         max_inflight: args.max_inflight.max(1),
+        target_step_ms: args.target_step_ms,
         ..EngineConfig::default()
     })?;
     info!(

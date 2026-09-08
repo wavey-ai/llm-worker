@@ -58,6 +58,12 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     max_inflight: usize,
 
+    /// Hold a decode step to about this long, admitting fewer requests at
+    /// once when they would slow each other past it. Zero leaves admission to
+    /// --max-inflight.
+    #[arg(long, default_value_t = 0)]
+    target_step_ms: u64,
+
     /// Ingress services to pull work from. Repeatable.
     #[arg(long = "ingress-url", env = "LLMQ_INGRESS_URLS", value_delimiter = ',')]
     ingress_urls: Vec<String>,
@@ -144,6 +150,7 @@ async fn main() -> Result<()> {
         model,
         n_ctx: args.ctx_size,
         max_inflight: args.max_inflight.max(1),
+        target_step_ms: args.target_step_ms,
         ..EngineConfig::default()
     })?;
     info!(

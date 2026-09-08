@@ -235,6 +235,46 @@ async fn queues_beyond_the_slot_count() {
     assert_eq!(engine.capacity().inflight, 0);
 }
 
+/// A step target holds the batch down even when slots are free: every
+/// sequence in a batch pays for the others, so admission is a latency
+/// decision, not a capacity one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_target_holds_the_batch_down() {
+    let engine = Engine::spawn(EngineConfig {
+        max_inflight: 8,
+        n_ctx: 1024,
+        // Below any real step, so the engine should never decode more than
+        // the one request it always admits.
+        target_step_ms: 1,
+        native_logs: false,
+        ..EngineConfig::default()
+    })
+    .expect("engine failed to start");
+
+    let mut generations: Vec<_> = (0..8)
+        .map(|_| engine.submit(ask("Count from 1 to 20.", 24)).expect("submit failed"))
+        .collect();
+
+    assert_eq!(engine.capacity().inflight, 8, "all eight were accepted");
+
+    let mut peak = 0;
+    let mut answers = 0;
+    for generation in &mut generations {
+        // Sampling can miss a peak, so this can only understate the batch.
+        peak = peak.max(engine.capacity().decoding);
+        let (text, _) = drain(generation).await;
+        assert!(!text.is_empty());
+        answers += 1;
+    }
+
+    assert_eq!(answers, 8, "every request was still served");
+    assert!(
+        peak <= 2,
+        "target ignored: {peak} sequences decoding at once with an unreachable step target"
+    );
+    assert_eq!(engine.capacity().inflight, 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn capacity_reports_inflight_work() {
     let engine = engine();
