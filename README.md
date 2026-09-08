@@ -1,28 +1,27 @@
 # llm-worker
 
-Local LLM inference, and a worker that serves it over HTTP.
+LLM inference on llama.cpp, served over HTTP through the
+[upload-response](https://github.com/wavey-ai/web-services) ring.
+
+## Layout
 
 ```
-llm-engine/      the engine. Owns the model, the context, sampling. No HTTP.
-llm-worker/      the adapter. Claims work from the upload-response ring and
-                 answers it in the OpenAI chat-completions format.
-examples/serve/  an ingress, for trying it out without a second service.
+llm-engine/      Inference engine. Loads the model, runs the decode loop.
+llm-worker/      Ring adapter and worker binary. Speaks OpenAI chat completions.
+examples/serve/  HTTP ingress, an in-process worker, and a chat page.
 ```
 
-The splits are dependency facts rather than conventions. The engine depends on
-nothing that speaks HTTP. The worker reaches a ring over HTTP but never serves
-it: no server crate, no listening socket, which is what lets the same code run
-against a remote ring and an in-process one. The example is the only place a
-port is opened.
+`llm-engine` has no HTTP dependency. `llm-worker` uses HTTP to reach a ring but
+does not serve one: no server crate, no listening socket. `examples/serve` is
+the only crate that binds a port.
 
-The model comes from the Hugging Face cache, downloaded on first use and
-shared with everything else on the machine that pulls from it. `--model`
-takes a GGUF file directly if you would rather not.
+Models are read from the Hugging Face cache, or from a path given with
+`--model`. Default is `unsloth/Qwen3.5-0.8B-GGUF`.
 
-## The engine
+## llm-engine
 
 ```rust
-let engine = Engine::spawn(EngineConfig::default())?;   // blocks until resident
+let engine = Engine::spawn(EngineConfig::default())?;   // blocks until loaded
 let mut generation = engine.submit(GenerateRequest::user("Say hi."))?;
 while let Some(event) = generation.recv().await {
     match event {
@@ -33,27 +32,25 @@ while let Some(event) = generation.recv().await {
 }
 ```
 
-`engine.capacity()` reports slot occupancy in the shape a scheduler's
-heartbeat wants. `generation.cancel()` stops the work, and so does dropping
-the `Generation` — that is the disconnected-client path, and it needs no
-coordination with the transport.
+`Engine::spawn` returns once the model is resident. `engine.capacity()` returns
+slot occupancy in the same fields as the ring's worker heartbeat.
 
-Cancellation lands at the next token boundary, so within ~20ms during
-generation, but only after prefill finishes for a long prompt.
+Generation stops on an end-of-generation token, at `max_tokens`, at the end of
+the context window, or on cancellation. `generation.cancel()` cancels; so does
+dropping the `Generation`. Cancellation takes effect at the next token
+boundary, about 20ms during generation, but not until prefill completes.
 
-There is a CLI over the same interface a worker uses:
+CLI:
 
 ```
 cargo run -p llm-engine -- --prompt "Say hi." --max-tokens 64
 cargo run -p llm-engine -- --system "Be brief." --think
 ```
 
-## The worker
+## llm-worker
 
-One engine attached to the [upload-response](https://github.com/wavey-ai/web-services)
-ring, claiming request lanes and streaming tokens back down response lanes.
-
-The GPU is here; the front door is elsewhere:
+Runs one engine and pulls work from one or more ingress services. Claims a
+request lane, generates, writes tokens to the matching response lane.
 
 ```
 llm-worker \
@@ -61,51 +58,45 @@ llm-worker \
   --ingress-url https://ingress-b:8443
 ```
 
-## The example
+No listening socket. Workers attach to a ring through its private
+mutually-authenticated control listener, which `examples/serve` does not start,
+so this binary cannot attach to the example.
 
-`examples/serve` is a front door of your own: an ingress, a worker, and a chat
-page in one process, over an in-process ring, so one binary is enough to try
-the thing out. Everything the server crate touches lives there.
+## examples/serve
 
-```
-cargo run -p llm-serve -- --tls-cert cert.pem --tls-key key.pem
-```
-
-Then open <https://localhost:8443/> — a self-signed certificate means the
-browser will want convincing first. The page is `examples/serve/ui/index.html`,
-embedded in the binary: no build step, no dependencies, streaming by
-`fetch` and a reader over the SSE body. Its Stop button aborts the request,
-which drops the connection, which closes the ring's stream, which cancels the
-generation — the whole path in one click.
-
-Generate a certificate to test with:
+An ingress, a worker and a chat page in one process over an in-process ring.
 
 ```
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -keyout key.pem -out cert.pem -subj "/CN=localhost"
+
+cargo run -p llm-serve -- --tls-cert cert.pem --tls-key key.pem
 ```
 
-```
-curl -sk -N https://localhost:8443/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"messages":[{"role":"user","content":"Say hi."}],"stream":true}'
-```
+Open <https://localhost:8443/>. The certificate is self-signed, so the browser
+warns first.
 
-### On the wire
+The page is `examples/serve/ui/index.html`, embedded in the binary. No build
+step, no dependencies. It streams with `fetch` and a reader over the SSE body.
+Stop calls `AbortController.abort()`, which closes the ring's stream and
+cancels the generation.
 
-`POST /v1/chat/completions` in the OpenAI shape. `stream: true` returns
-`text/event-stream` chunks ending in `data: [DONE]`; otherwise one
-`chat.completion` JSON body. `GET /health` reports the engine's own capacity
-and `GET /v1/models` names the model.
+### API
 
-Beyond the standard fields: `think` (or `chat_template_kwargs.enable_thinking`)
-lets the model emit its reasoning block. Unknown fields are ignored rather
-than rejected.
+`POST /v1/chat/completions` takes an OpenAI chat completions request. With
+`stream: true` the response is `text/event-stream` chunks terminated by
+`data: [DONE]`, otherwise a single `chat.completion` JSON body.
 
-### Load
+`GET /health` returns capacity and model information. `GET /v1/models` returns
+the model name.
 
-`examples/serve/load.sh` fires N completions at an ingress at once and reports
-what came back.
+Two non-standard fields are accepted: `think` and
+`chat_template_kwargs.enable_thinking`, either of which lets the model emit its
+reasoning block. Unknown fields are ignored.
+
+### load.sh
+
+`examples/serve/load.sh` sends N completions and reports per-request timings.
 
 ```
 N=8 MAX_TOKENS=32 ./examples/serve/load.sh
@@ -121,151 +112,32 @@ wall 5s · 256 tokens · 51.2 tok/s across all requests
 engine inflight while running: max 1 of 1
 ```
 
-Time to first byte is the tell. With one slot it climbs in one-generation
-steps, because each request is waiting for the slot rather than for the GPU.
+Requests start together unless `ARRIVE=<ms>` is set, which spreads the start
+times at random over that many milliseconds. Results are in
+[PERFORMANCE.md](PERFORMANCE.md).
 
-### What batching buys, measured
+### Flags
 
-An M1 Air, Qwen3.5-0.8B Q4_K_M, eight clients at once:
+`--max-inflight` sets the slot count: how many requests decode in one batch.
+`--target-step-ms` caps how long a decode step may take instead, and the engine
+admits fewer requests to stay under it. Step cost is measured every step and
+admission pauses while the measurement is over target. Each sequence produces
+one token per step, so the target is also the per-client token rate: 100ms is
+10 tokens per second per client. Zero, the default, leaves admission to
+`--max-inflight`.
 
-| slots | clients | aggregate | time to first byte |
-|-------|---------|-----------|--------------------|
-| 1     | 8       | 51.8 tok/s | 0.01s → 4.3s, in steps |
-| 4     | 8       | 86.5 tok/s | |
-| 8     | 8       | 88.9 tok/s | ~0.01s, all of them |
-| 8     | 32      | 92.8 tok/s | |
-| 16    | 32      | 109.9 tok/s | |
-| 32    | 32      | 124.6 tok/s | |
+`--ctx-size` is per slot. Eight slots at 4096 allocates a 32768-token context
+and the KV memory for it.
 
-A lone client is unaffected by the slot count: 50.3 tok/s at one slot, 51.5 at
-eight. Nobody pays for capacity they are not using.
+`--ring-streams` (`llm-serve`) sets how many requests the ring parks at once.
+Beyond that it returns 503.
 
-Step time is linear in the batch, and the line is a good fit from 8 slots up:
+`capacity()` reports `inflight` (accepted, not finished), `decoding` (in the
+current batch), `max_inflight` and `available_slots`. The ring's heartbeat
+carries the first, third and fourth. Requests accepted but not yet admitted
+count as inflight.
 
-```
-batch   aggregate     step     per sequence
-    1   51.8 tok/s    19 ms    19.3 ms
-    8   88.9 tok/s    90 ms    11.2 ms
-   16  109.9 tok/s   146 ms     9.1 ms
-   32  124.6 tok/s   257 ms     8.0 ms
+## Other documents
 
-step = 34ms + 7.0ms x batch    →  ceiling ≈ 143 tok/s
-```
-
-Two numbers in that line matter. The 7ms per sequence is what stops batching
-paying off the way it should; it is the marginal cost of one more sequence in
-the batch, and it puts a ceiling near 143 tok/s however many slots there are.
-The 34ms is a fixed cost that appears only above batch 1 — a batch of one
-takes 19ms, less than the constant — which is llama.cpp taking a different
-kernel path once there is more than one token to decode.
-
-Aggregate throughput is not the only thing that moves. At 32 clients on 32
-slots each one sees about 4 tok/s, against 50 on its own. That is the trade
-being made: everyone starts immediately and nobody waits in line, but a busy
-engine is slower for each of them than an idle one.
-
-### Choosing the slot count
-
-All-at-once is a worst case, not a workload. `ARRIVE` spreads the start times,
-which is what decides how full the batches actually get:
-
-```
-N=32 ARRIVE=4000 MAX_TOKENS=48 ./examples/serve/load.sh
-```
-
-32 requests arriving at random over four seconds, median of three runs:
-
-| slots | p50    | p95    | spread | aggregate |
-|-------|--------|--------|--------|-----------|
-| 4     | 6.30s  | 12.76s | 6.5s   | 84.5 tok/s |
-| 8     | 6.64s  | 12.30s | 5.7s   | 86.6 tok/s |
-| 16    | 6.32s  | 9.96s  | 3.6s   | 102.2 tok/s |
-| 32    | 8.68s  | 9.12s  | 0.4s   | 111.2 tok/s |
-
-Below the arrival rate, slots are a queue: the median is fine because most
-requests find a free slot, and the tail is bad because the unlucky ones wait.
-Above it, nothing queues and every batch is as full as demand allows: the tail
-and the total improve, and everybody's median gets worse together. At 32 slots
-p50 and p95 are 0.4s apart — perfectly fair, uniformly slower.
-
-Sixteen is the knee here: p50 no worse than at four slots, p95 nearly three
-seconds better, 21% more throughput. Thirty-two buys another 9% of throughput
-for 38% on the median.
-
-The knee is a property of the load, not of the engine, so it moves. What does
-not move is the shape: **capacity is bought with individual latency, and the
-exchange rate gets worse as the batch grows** — 7ms per sequence, every step,
-for every sequence in it.
-
-### Setting a latency target instead
-
-`--max-inflight` is a guess about load. `--target-step-ms` is a statement
-about what a caller should see, which the engine then holds to by admitting
-fewer requests at once. It needs no constants: a step's cost is measured every
-step, and admission stops while that measurement is over the target.
-
-Since every sequence in the batch decodes one token per step, the target *is*
-the per-caller rate: 100ms is ten tokens a second each, whatever the model and
-whatever the hardware.
-
-With 32 slots free and 32 clients arriving at once:
-
-| target | batch used | measured step |
-|--------|------------|---------------|
-| off    | 32         | 207ms |
-| 60ms   | 7          | 64ms  |
-| 100ms  | 10         | 77ms  |
-| 200ms  | 18         | 132ms |
-
-It is a real trade, not a free win. 32 requests over four seconds, median of
-three runs:
-
-| | stream rate | p50 | p95 | aggregate |
-|--|-------------|-----|-----|-----------|
-| no target   | 4.8 tok/s | 8.60s | 9.11s  | 113.2 tok/s |
-| target 60ms | 6.0 tok/s | 6.24s | 11.22s | 86.5 tok/s |
-
-Text appears 25% faster and the median request finishes 27% sooner, paid for
-with 23% on the tail and 24% of the throughput. Which way that trade should go
-is a product question: a person watching an answer appear cares about the
-first two columns, and a batch job cares about the last.
-
-The latency win is unambiguous — everyone starts at once instead of queueing.
-The throughput win is real but smaller than the theory says it should be, and
-`llm_engine=debug` says where it goes:
-
-```
-step slots=8 enqueue_us=1043 gpu_us=79214
-```
-
-(`enqueue_us` is the call; `gpu_us` is the wait for it to actually happen.)
-
-Metal runs `decode` asynchronously, so the enqueue returns in 1ms and the
-first read of the logits waits for the GPU. That wait is 79ms for a batch of
-eight, against ~19ms for a batch of one — so each extra sequence costs about
-half a full forward pass instead of nearly nothing. Everything outside the GPU
-— sampling, detokenizing, handing tokens to callers — is 2% of a step.
-
-Two suspects ruled out and one still open. It is not the engine loop, which is
-that 2%. It is not `kv_unified`, which llama.cpp defaults to false: forcing it
-true changed nothing. What remains is the model. `arch = qwen35` is a hybrid —
-only 6 of its 24 layers keep a KV cache, the other 18 are linear-attention
-layers carrying recurrent state per sequence, and per-sequence state does not
-amortise across a batch the way shared weights do. The same GPU batches 23
-tokens of one sequence at 0.4ms each during prefill and 8 tokens of eight
-sequences at 9.9ms each during decode. Confirming that needs a dense
-transformer of similar size to compare against.
-
-### Capacity
-
-`--max-inflight` sizes the engine, and the engine's `capacity()` is what the
-ring hears in its heartbeat — one number, not two. Requests beyond that queue
-inside the engine and still count as occupancy, so a scheduler reading
-`available_slots` is never told there is room that does not exist.
-
-`--ctx-size` is **per slot**. Eight slots at 4096 is a 32768-token context,
-and the KV memory to match.
-
-The example runs the public listener only. A worker on another machine reaches
-a ring through its private mutually-authenticated control listener, which the
-example does not start.
+- [PERFORMANCE.md](PERFORMANCE.md) — throughput and latency measurements.
+- [TODO.md](TODO.md) — open questions and planned work.
