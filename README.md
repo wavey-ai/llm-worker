@@ -164,6 +164,39 @@ slots each one sees about 4 tok/s, against 50 on its own. That is the trade
 being made: everyone starts immediately and nobody waits in line, but a busy
 engine is slower for each of them than an idle one.
 
+### Choosing the slot count
+
+All-at-once is a worst case, not a workload. `ARRIVE` spreads the start times,
+which is what decides how full the batches actually get:
+
+```
+N=32 ARRIVE=4000 MAX_TOKENS=48 ./examples/serve/load.sh
+```
+
+32 requests arriving at random over four seconds, median of three runs:
+
+| slots | p50    | p95    | spread | aggregate |
+|-------|--------|--------|--------|-----------|
+| 4     | 6.30s  | 12.76s | 6.5s   | 84.5 tok/s |
+| 8     | 6.64s  | 12.30s | 5.7s   | 86.6 tok/s |
+| 16    | 6.32s  | 9.96s  | 3.6s   | 102.2 tok/s |
+| 32    | 8.68s  | 9.12s  | 0.4s   | 111.2 tok/s |
+
+Below the arrival rate, slots are a queue: the median is fine because most
+requests find a free slot, and the tail is bad because the unlucky ones wait.
+Above it, nothing queues and every batch is as full as demand allows: the tail
+and the total improve, and everybody's median gets worse together. At 32 slots
+p50 and p95 are 0.4s apart — perfectly fair, uniformly slower.
+
+Sixteen is the knee here: p50 no worse than at four slots, p95 nearly three
+seconds better, 21% more throughput. Thirty-two buys another 9% of throughput
+for 38% on the median.
+
+The knee is a property of the load, not of the engine, so it moves. What does
+not move is the shape: **capacity is bought with individual latency, and the
+exchange rate gets worse as the batch grows** — 7ms per sequence, every step,
+for every sequence in it.
+
 The latency win is unambiguous — everyone starts at once instead of queueing.
 The throughput win is real but smaller than the theory says it should be, and
 `llm_engine=debug` says where it goes:
