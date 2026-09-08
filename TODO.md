@@ -30,8 +30,8 @@ divergence. The persistent context needed for this already exists.
 ## Queue location
 
 With `--target-step-ms` set, requests that are accepted but not admitted wait
-inside the engine and count as `inflight`. They arguably belong in the ring
-where a scheduler can see them. `capacity()` reports `decoding` separately, but
+inside the engine and count as `inflight`. In the ring a scheduler could see
+them. `capacity()` reports `decoding` separately, but
 `WorkerHeartbeatUpdate` has no field for it, so the ring cannot distinguish
 busy from accepted.
 

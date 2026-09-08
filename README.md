@@ -73,8 +73,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 cargo run -p llm-serve -- --tls-cert cert.pem --tls-key key.pem
 ```
 
-Open <https://localhost:8443/>. The certificate is self-signed, so the browser
-warns first.
+Open <https://localhost:8443/>. The certificate is self-signed; accept the
+browser warning.
 
 The page is `examples/serve/ui/index.html`, embedded in the binary. No build
 step, no dependencies. It streams with `fetch` and a reader over the SSE body.
