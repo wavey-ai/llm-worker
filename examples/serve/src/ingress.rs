@@ -19,6 +19,10 @@ use web_service::{
 
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
+/// The chat page, served from `/`. Embedded rather than read at runtime so
+/// the example is still one binary you can copy to a machine and run.
+const INDEX: &str = include_str!("../ui/index.html");
+
 pub struct AppRouter {
     upload: Arc<UploadResponseRouter>,
     engine: Engine,
@@ -39,6 +43,16 @@ impl AppRouter {
             status,
             body: Some(Bytes::from(body)),
             content_type: Some("application/json".into()),
+            headers: vec![("cache-control".into(), "no-store".into())],
+            etag: None,
+        }
+    }
+
+    fn page() -> HandlerResponse {
+        HandlerResponse {
+            status: StatusCode::OK,
+            body: Some(Bytes::from_static(INDEX.as_bytes())),
+            content_type: Some("text/html; charset=utf-8".into()),
             headers: vec![("cache-control".into(), "no-store".into())],
             etag: None,
         }
@@ -92,9 +106,8 @@ impl AppRouter {
 impl Router for AppRouter {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
         match (req.method(), req.uri().path()) {
-            (&Method::GET, "/") | (&Method::GET, "/health") | (&Method::GET, "/healthz") => {
-                Ok(self.health())
-            }
+            (&Method::GET, "/") => Ok(Self::page()),
+            (&Method::GET, "/health") | (&Method::GET, "/healthz") => Ok(self.health()),
             (&Method::GET, "/v1/models") => Ok(self.models()),
             _ => Ok(Self::not_found()),
         }

@@ -60,14 +60,28 @@ llm-worker \
 
 ## The example
 
-`examples/serve` is a front door of your own: an ingress and a worker in one
-process, over an in-process ring, so one binary is enough to try the thing
-out. Everything the server crate touches lives there.
+`examples/serve` is a front door of your own: an ingress, a worker, and a chat
+page in one process, over an in-process ring, so one binary is enough to try
+the thing out. Everything the server crate touches lives there.
 
 ```
 cargo run -p llm-serve -- \
   --model models/Qwen3.5-0.8B-Q4_K_M.gguf \
   --tls-cert cert.pem --tls-key key.pem
+```
+
+Then open <https://localhost:8443/> — a self-signed certificate means the
+browser will want convincing first. The page is `examples/serve/ui/index.html`,
+embedded in the binary: no build step, no dependencies, streaming by
+`fetch` and a reader over the SSE body. Its Stop button aborts the request,
+which drops the connection, which closes the ring's stream, which cancels the
+generation — the whole path in one click.
+
+Generate a certificate to test with:
+
+```
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout key.pem -out cert.pem -subj "/CN=localhost"
 ```
 
 ```

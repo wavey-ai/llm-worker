@@ -196,15 +196,22 @@ async fn rejects_a_malformed_request() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn serves_health_without_touching_the_ring() {
+async fn serves_the_page_and_health_without_touching_the_ring() {
     let router = harness();
+
     let request = Request::builder().method("GET").uri("/health").body(()).unwrap();
     let response = router.route(request).await.expect("health should answer");
-
     assert_eq!(response.status, StatusCode::OK);
     let health: serde_json::Value =
         serde_json::from_slice(&response.body.expect("a body")).unwrap();
     assert_eq!(health["status"], "ok");
     assert_eq!(health["model"], "llm-test");
     assert_eq!(health["inflight"], 0);
+
+    let request = Request::builder().method("GET").uri("/").body(()).unwrap();
+    let response = router.route(request).await.expect("the page should answer");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.content_type.as_deref(), Some("text/html; charset=utf-8"));
+    let page = String::from_utf8(response.body.expect("a body").to_vec()).unwrap();
+    assert!(page.contains(CHAT_COMPLETIONS_PATH), "the page must post somewhere real");
 }
