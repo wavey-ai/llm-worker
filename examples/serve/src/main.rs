@@ -96,6 +96,10 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Before the model: loading half a gigabyte only to fail on a missing
+    // flag is a bad way to find out about it.
+    let (cert, key) = tls_base64(&args)?;
+
     let model = match &args.model {
         Some(path) => ModelSource::Local(path.clone()),
         None => ModelSource::HuggingFace { repo: args.repo.clone(), file: args.file.clone() },
@@ -133,7 +137,6 @@ async fn main() -> Result<()> {
         args.model_name.clone(),
     ));
 
-    let (cert, key) = tls_base64(&args)?;
     let server = H2H3Server::builder()
         .with_tls(cert, key)
         .with_port(args.port)

@@ -37,6 +37,10 @@ impl ModelSource {
     fn resolve(&self) -> Result<PathBuf> {
         match self {
             Self::Local(path) => {
+                // llama.cpp asserts rather than returning an error for a
+                // missing file, and an assert on the engine thread reaches the
+                // caller as "the thread exited" with the real cause on stderr.
+                anyhow::ensure!(path.is_file(), "no model file at {}", path.display());
                 debug!(path = %path.display(), "using local model");
                 Ok(path.clone())
             }
