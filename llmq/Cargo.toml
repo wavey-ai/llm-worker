@@ -1,0 +1,23 @@
+[package]
+name = "llmq"
+description = "Local LLM inference engine. Owns the model; knows nothing of HTTP."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "llmq"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llmq"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+encoding_rs = "0.8"
+hf-hub = "0.5.0"
+llama-cpp-2 = { version = "0.1.156", features = ["metal"] }

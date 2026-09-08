@@ -1,0 +1,31 @@
+[package]
+name = "llmq-worker"
+description = "Serves llmq over the upload-response ring. No listening socket of its own."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "llmq_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llmq-worker"
+path = "src/main.rs"
+
+[dependencies]
+llmq = { path = "../llmq" }
+
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+async-trait = "0.1"
+bytes = "1"
+http = "1"
+
+gpu-worker = { git = "https://github.com/wavey-ai/gpu-workers.git", branch = "main", package = "gpu-worker", features = ["upload-response"] }
+upload-response = { git = "https://github.com/wavey-ai/web-services.git", branch = "main", package = "av-upload-response" }
