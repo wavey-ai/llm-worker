@@ -128,16 +128,41 @@ steps, because each request is waiting for the slot rather than for the GPU.
 
 An M1 Air, Qwen3.5-0.8B Q4_K_M, eight clients at once:
 
-| slots | aggregate | time to first byte |
-|-------|-----------|--------------------|
-| 1     | 51.8 tok/s | 0.01s → 4.3s, in steps |
-| 2     | 57.4 tok/s | |
-| 4     | 86.5 tok/s | |
-| 8     | 88.9 tok/s | ~0.01s, all of them |
-| 16 slots, 16 clients | 109.8 tok/s | |
+| slots | clients | aggregate | time to first byte |
+|-------|---------|-----------|--------------------|
+| 1     | 8       | 51.8 tok/s | 0.01s → 4.3s, in steps |
+| 4     | 8       | 86.5 tok/s | |
+| 8     | 8       | 88.9 tok/s | ~0.01s, all of them |
+| 8     | 32      | 92.8 tok/s | |
+| 16    | 32      | 109.9 tok/s | |
+| 32    | 32      | 124.6 tok/s | |
 
 A lone client is unaffected by the slot count: 50.3 tok/s at one slot, 51.5 at
 eight. Nobody pays for capacity they are not using.
+
+Step time is linear in the batch, and the line is a good fit from 8 slots up:
+
+```
+batch   aggregate     step     per sequence
+    1   51.8 tok/s    19 ms    19.3 ms
+    8   88.9 tok/s    90 ms    11.2 ms
+   16  109.9 tok/s   146 ms     9.1 ms
+   32  124.6 tok/s   257 ms     8.0 ms
+
+step = 34ms + 7.0ms x batch    →  ceiling ≈ 143 tok/s
+```
+
+Two numbers in that line matter. The 7ms per sequence is what stops batching
+paying off the way it should; it is the marginal cost of one more sequence in
+the batch, and it puts a ceiling near 143 tok/s however many slots there are.
+The 34ms is a fixed cost that appears only above batch 1 — a batch of one
+takes 19ms, less than the constant — which is llama.cpp taking a different
+kernel path once there is more than one token to decode.
+
+Aggregate throughput is not the only thing that moves. At 32 clients on 32
+slots each one sees about 4 tok/s, against 50 on its own. That is the trade
+being made: everyone starts immediately and nobody waits in line, but a busy
+engine is slower for each of them than an idle one.
 
 The latency win is unambiguous — everyone starts at once instead of queueing.
 The throughput win is real but smaller than the theory says it should be, and
@@ -146,6 +171,8 @@ The throughput win is real but smaller than the theory says it should be, and
 ```
 step slots=8 enqueue_us=1043 gpu_us=79214
 ```
+
+(`enqueue_us` is the call; `gpu_us` is the wait for it to actually happen.)
 
 Metal runs `decode` asynchronously, so the enqueue returns in 1ms and the
 first read of the logits waits for the GPU. That wait is 79ms for a batch of

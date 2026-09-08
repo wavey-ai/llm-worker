@@ -64,6 +64,12 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     max_inflight: usize,
 
+    /// Requests the ring will park at once. Anything beyond this is refused
+    /// with a 503 rather than queued, so it wants to be comfortably above the
+    /// slot count: the queue is the point of having a ring.
+    #[arg(long, default_value_t = 16)]
+    ring_streams: usize,
+
     #[arg(short, long, default_value_t = 8443)]
     port: u16,
 
@@ -119,7 +125,10 @@ async fn main() -> Result<()> {
         "engine ready"
     );
 
-    let service = Arc::new(UploadResponseService::new(UploadResponseConfig::default()));
+    let service = Arc::new(UploadResponseService::new(UploadResponseConfig {
+        num_streams: args.ring_streams.max(1),
+        ..UploadResponseConfig::default()
+    }));
 
     let mut config = WorkerConfig::new(format!("llm-{}", std::process::id()));
     config.max_inflight = engine.capacity().max_inflight;
