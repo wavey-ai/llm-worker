@@ -11,9 +11,9 @@ llm-worker/      Ring adapter and worker binary. Speaks OpenAI chat completions.
 examples/serve/  HTTP ingress, an in-process worker, and a chat page.
 ```
 
-`llm-engine` has no HTTP dependency. `llm-worker` uses HTTP to reach a ring but
-does not serve one: no server crate, no listening socket. `examples/serve` is
-the only crate that binds a port.
+`llm-engine` depends on llama.cpp and tokio. `llm-worker` adds an HTTP client
+and the ring adapter, and reaches a ring as a client. `examples/serve` adds the
+server crate and binds the port.
 
 Models are read from the Hugging Face cache, or from a path given with
 `--model`. Default is `unsloth/Qwen3.5-0.8B-GGUF`.
@@ -38,7 +38,8 @@ slot occupancy in the same fields as the ring's worker heartbeat.
 Generation stops on an end-of-generation token, at `max_tokens`, at the end of
 the context window, or on cancellation. `generation.cancel()` cancels; so does
 dropping the `Generation`. Cancellation takes effect at the next token
-boundary, about 20ms during generation, but not until prefill completes.
+boundary: about 20ms during generation, and after prefill completes for a
+prompt still being ingested.
 
 CLI:
 
@@ -58,9 +59,9 @@ llm-worker \
   --ingress-url https://ingress-b:8443
 ```
 
-No listening socket. Workers attach to a ring through its private
-mutually-authenticated control listener, which `examples/serve` does not start,
-so this binary cannot attach to the example.
+Workers attach to a ring through its private mutually-authenticated control
+listener. `examples/serve` starts the public listener only, so `llm-worker`
+needs a ring started elsewhere.
 
 ## examples/serve
 
@@ -76,10 +77,10 @@ cargo run -p llm-serve -- --tls-cert cert.pem --tls-key key.pem
 Open <https://localhost:8443/>. The certificate is self-signed; accept the
 browser warning.
 
-The page is `examples/serve/ui/index.html`, embedded in the binary. No build
-step, no dependencies. It streams with `fetch` and a reader over the SSE body.
-Stop calls `AbortController.abort()`, which closes the ring's stream and
-cancels the generation.
+The page is `examples/serve/ui/index.html`, embedded in the binary. It is one
+HTML file the browser loads as-is, streaming with `fetch` and a reader over the
+SSE body. Stop calls `AbortController.abort()`, which closes the ring's stream
+and cancels the generation.
 
 ### API
 
@@ -132,10 +133,10 @@ and the KV memory for it.
 `--ring-streams` (`llm-serve`) sets how many requests the ring parks at once.
 Beyond that it returns 503.
 
-`capacity()` reports `inflight` (accepted, not finished), `decoding` (in the
-current batch), `max_inflight` and `available_slots`. The ring's heartbeat
-carries the first, third and fourth. Requests accepted but not yet admitted
-count as inflight.
+`capacity()` reports `inflight` (accepted and still running), `decoding` (in
+the current batch), `max_inflight` and `available_slots`. The ring's heartbeat
+carries the first, third and fourth. Requests waiting for admission count as
+inflight.
 
 ## Other documents
 

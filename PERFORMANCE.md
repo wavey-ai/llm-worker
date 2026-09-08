@@ -17,8 +17,8 @@ of three unless stated.
 | 16    | 32      | 109.9 tok/s | |
 | 32    | 32      | 124.6 tok/s | |
 
-A single client is unaffected by the slot count: 50.3 tok/s with one slot,
-51.5 tok/s with eight.
+A single client runs at the same rate whatever the slot count: 50.3 tok/s with
+one slot, 51.5 tok/s with eight.
 
 Step time is linear in batch size from batch 8 up:
 
@@ -77,7 +77,7 @@ latency at 7ms per sequence per step.
 
 | | stream rate | p50 | p95 | aggregate |
 |--|-------------|-----|-----|-----------|
-| no target   | 4.8 tok/s | 8.60s | 9.11s  | 113.2 tok/s |
+| off         | 4.8 tok/s | 8.60s | 9.11s  | 113.2 tok/s |
 | target 60ms | 6.0 tok/s | 6.24s | 11.22s | 86.5 tok/s |
 
 Tokens arrive 25% faster and p50 is 27% lower, at the cost of 23% on p95 and
@@ -96,17 +96,18 @@ first read of the logits blocks until the GPU finishes, so `gpu_us` is the cost
 of the step: 79ms at batch 8, about 19ms at batch 1. Sampling, detokenizing and
 delivering tokens are 2% of a step.
 
-Ruled out as the cause of the 7ms per sequence:
+Three candidates for the 7ms per sequence, measured and excluded:
 
-- The engine loop. It is that 2%, and there are no idle spins between decodes.
-- Context length. 8 slots at ctx 512 and ctx 4096 measure 88.3 and 88.9 tok/s.
-- `kv_unified`. llama.cpp defaults it to false, which splits a batch into one
-  ubatch per sequence. Forcing it true, confirmed in llama.cpp's log, changed
-  nothing.
+- The engine loop accounts for 2% of a step, and decodes run back to back.
+- Context length: 8 slots at ctx 512 and ctx 4096 measure 88.3 and 88.9 tok/s.
+- `kv_unified` defaults to false in llama.cpp, which splits a batch into one
+  ubatch per sequence. Forcing it true, confirmed in llama.cpp's log, held
+  throughput at 88 tok/s.
 
 Probable cause, unconfirmed: `arch = qwen35` is a hybrid. 6 of 24 layers keep a
 KV cache; the other 18 are linear-attention layers holding recurrent state per
-sequence, which does not amortise across a batch the way shared weights do.
+sequence. That state is read once per sequence, where shared weights are read
+once for the whole batch.
 7ms at the ~27 GB/s this machine achieves is ~190MB per sequence per step,
 about 40% of the model. The same GPU processes 23 tokens of one sequence at
 0.4ms each during prefill and 8 tokens of eight sequences at 9.9ms each during
@@ -119,15 +120,15 @@ arrival order. Before that it returned them in slot order, and slots are
 allocated from a stack and reused newest-first, so a request in a rarely
 reached slot waited behind every stream that arrived after it.
 
-The change made no measurable difference to p50, p95 or throughput.
-`load.sh` is closed-loop with uniform requests, so ordering changes which
-request waits, not how long the set takes. Demonstrating the difference needs
-an open-loop harness: arrivals at a fixed rate above capacity, measuring
-worst-case wait.
+After the change p50, p95 and throughput matched the previous figures.
+`load.sh` is closed-loop with uniform requests, so ordering decides which
+request waits while the set takes the same time either way. Demonstrating the
+difference needs an open-loop harness: arrivals at a fixed rate above capacity,
+measuring worst-case wait.
 
 ## Measurement notes
 
-Errors found in this benchmark and fixed:
+Errors found in this benchmark and since fixed:
 
 - Wall clock from `date +%s` quantised aggregate figures to integer seconds.
   An apparent effect of context size on throughput was that artifact. Now uses
