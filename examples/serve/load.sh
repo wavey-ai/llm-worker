@@ -39,8 +39,6 @@ echo
 sampler=$!
 disown "$sampler" 2>/dev/null || true   # so killing it later stays quiet
 
-started=$(date +%s)
-
 pids=()
 for i in $(seq 1 "$N"); do
   (
@@ -58,11 +56,14 @@ done
 # never returns on its own.
 wait "${pids[@]}"
 
-elapsed=$(( $(date +%s) - started ))
 kill "$sampler" 2>/dev/null || true
 
 printf '%3s  %7s  %7s  %7s  %7s  %s\n' "#" "ttfb" "total" "tokens" "tok/s" "finish"
 total_tokens=0
+# The requests all start within a few milliseconds of each other, so the
+# slowest one's own clock is the wall time — and it has millisecond
+# resolution, which `date +%s` does not.
+slowest=0
 for i in $(seq 1 "$N"); do
   out="$work/$i.out"
   status=$(grep -o 'status=[0-9]*' "$out" | cut -d= -f2)
@@ -81,11 +82,12 @@ for i in $(seq 1 "$N"); do
   # Generation time is what is left after the wait for a slot.
   rate=$(awk -v t="$tokens" -v a="$total" -v b="$ttfb" 'BEGIN { d = a - b; printf "%.1f", (d > 0 ? t / d : 0) }')
   total_tokens=$(( total_tokens + tokens ))
+  slowest=$(awk -v a="$slowest" -v b="$total" 'BEGIN { print (b > a ? b : a) }')
   printf '%3s  %7s  %7s  %7s  %7s  %s\n' "$i" "$ttfb" "$total" "$tokens" "$rate" "$finish"
 done
 
 echo
-echo "wall ${elapsed}s · $total_tokens tokens · $(awk -v t="$total_tokens" -v s="$elapsed" 'BEGIN { printf "%.1f", (s > 0 ? t / s : t) }') tok/s across all requests"
+echo "wall $(awk -v s="$slowest" 'BEGIN { printf "%.2f", s }')s · $total_tokens tokens · $(awk -v t="$total_tokens" -v s="$slowest" 'BEGIN { printf "%.1f", (s > 0 ? t / s : 0) }') tok/s across all requests"
 if [ -s "$work/inflight" ]; then
   echo "engine inflight while running: max $(sort -n "$work/inflight" | tail -1) of $(grep -o '"max_inflight":[0-9]*' "$work/health" | cut -d: -f2)"
 fi

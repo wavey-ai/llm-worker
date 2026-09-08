@@ -1,6 +1,7 @@
 //! Local LLM inference engine.
 //!
-//! The engine owns the model and its context on a dedicated OS thread.
+//! The engine owns the model and one shared context on a dedicated OS thread,
+//! decoding every active request together in a single forward pass.
 //! `llama.cpp`'s `decode` is synchronous, blocks for the duration of a forward
 //! pass, and needs `&mut` access to the context, so it cannot run on an async
 //! runtime's worker threads or be shared between tasks. Callers submit work
@@ -10,16 +11,19 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::pin;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::{LogOptions, ggml_time_us, send_logs_to_tracing};
 use tokio::sync::mpsc;
 use tracing::{debug, info, info_span, trace, warn};
@@ -334,49 +338,27 @@ impl Drop for Generation {
         self.cancel();
     }
 }
-
 fn engine_thread(
     config: EngineConfig,
-    mut jobs: mpsc::Receiver<Job>,
+    jobs: mpsc::Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<ModelInfo>>,
     inflight: Arc<AtomicUsize>,
 ) {
     send_logs_to_tracing(LogOptions::default().with_logs_enabled(config.native_logs));
 
-    let started = match Runtime::load(&config) {
+    let runtime = match Runtime::load(&config) {
         Ok(runtime) => runtime,
         Err(err) => {
             let _ = ready.send(Err(err));
             return;
         }
     };
-    let mut runtime = started;
-    if ready.send(Ok(runtime.info.clone())).is_err() {
-        return; // Caller gave up while we were loading.
-    }
 
-    while let Some(job) = jobs.blocking_recv() {
-        let outcome = runtime.run(&job);
-
-        // Release the slot *before* announcing completion, so a caller that
-        // reads `capacity()` on seeing the terminal event never sees a slot
-        // that is finished but still counted.
-        inflight.fetch_sub(1, Ordering::AcqRel);
-
-        let event = match outcome {
-            Ok(Outcome { stop, prompt_tokens, tokens, elapsed_ms }) => Event::Done {
-                stop,
-                prompt_tokens,
-                tokens,
-                elapsed_ms,
-            },
-            Err(err) => {
-                warn!(error = %err, "generation failed");
-                Event::Failed(err.to_string())
-            }
-        };
-        let _ = job.events.blocking_send(event);
-    }
+    // A context borrows the model it came from, so the two cannot live side by
+    // side in one struct. It lives inside `serve` instead, for exactly as long
+    // as the engine does, which also keeps the teardown order right: context,
+    // then model, then the backend that outlives both.
+    runtime.serve(jobs, ready, inflight);
 }
 
 /// llama.cpp's backend is process-global: `LlamaBackend::init` fails with
@@ -391,20 +373,92 @@ fn shared_backend() -> Result<&'static LlamaBackend> {
         .map_err(|err| anyhow!("failed to initialise the llama backend: {err}"))
 }
 
-/// What a finished job produced. The terminal event is sent by the engine loop
-/// rather than here, so slot accounting settles first.
-struct Outcome {
-    stop: Stop,
+/// How long a slot may hold its sequence while the caller refuses to read
+/// before the engine takes the slot back.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Idle wait when there is nothing to decode but something still to deliver.
+const IDLE_TICK: Duration = Duration::from_millis(1);
+
+/// One request, occupying one sequence of the shared context.
+struct Slot {
+    job: Job,
+    sampler: LlamaSampler,
+    /// A token is a byte sequence, not a character, so a multi-byte character
+    /// can straddle two tokens. This holds the partial bytes until they form
+    /// one, and so is per slot rather than per engine.
+    decoder: encoding_rs::Decoder,
+    seq_id: u32,
+    /// Position the next token will occupy.
+    n_cur: i32,
+    /// The token to feed at `n_cur`. Already sent to the caller.
+    next_input: LlamaToken,
     prompt_tokens: u32,
-    tokens: u32,
-    elapsed_ms: u64,
+    n_decoded: u32,
+    /// Tokens this slot may still generate.
+    budget: u32,
+    /// Whether that budget came from the context rather than the request.
+    context_bound: bool,
+    started_us: i64,
+    /// A piece the caller has not taken yet. While this is set the slot stays
+    /// out of the batch: one slow reader must not hold up the others.
+    pending: Option<Event>,
+    stalled_since: Option<Instant>,
+}
+
+impl Slot {
+    /// Try to hand the caller its last piece. A slot with nothing pending is
+    /// ready to decode again.
+    fn flush(&mut self) -> Flush {
+        let Some(event) = self.pending.take() else {
+            return Flush::Ready;
+        };
+        match self.job.events.try_send(event) {
+            Ok(()) => {
+                self.stalled_since = None;
+                Flush::Ready
+            }
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                self.pending = Some(event);
+                let since = *self.stalled_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > STALL_TIMEOUT {
+                    Flush::Abandoned
+                } else {
+                    Flush::Stalled
+                }
+            }
+            // Receiver gone. Dropping a `Generation` sets the cancel flag too,
+            // but a closed channel is the earlier and more direct signal.
+            Err(mpsc::error::TrySendError::Closed(_)) => Flush::Abandoned,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.job.cancel.load(Ordering::Acquire)
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        ((ggml_time_us() - self.started_us).max(0) / 1_000) as u64
+    }
+}
+
+enum Flush {
+    /// Nothing outstanding; the slot can be decoded.
+    Ready,
+    /// The caller is behind. Skip this slot for now.
+    Stalled,
+    /// The caller is gone, or too far behind to wait for.
+    Abandoned,
 }
 
 struct Runtime {
     model: LlamaModel,
     backend: &'static LlamaBackend,
     info: ModelInfo,
+    /// Context available to each slot. The shared context is this times the
+    /// slot count.
     n_ctx: u32,
+    max_inflight: u32,
 }
 
 impl Runtime {
@@ -434,136 +488,430 @@ impl Runtime {
             n_layer: model.n_layer(),
             n_ctx: config.n_ctx,
         };
-        Ok(Self { model, backend, info, n_ctx: config.n_ctx })
+        Ok(Self {
+            model,
+            backend,
+            info,
+            n_ctx: config.n_ctx,
+            max_inflight: config.max_inflight.max(1) as u32,
+        })
     }
 
-    fn run(&mut self, job: &Job) -> Result<Outcome> {
-        if job.cancel.load(Ordering::Acquire) {
-            // Cancelled while queued: never touch the GPU for it.
-            return Ok(Outcome {
-                stop: Stop::Cancelled,
-                prompt_tokens: 0,
-                tokens: 0,
-                elapsed_ms: 0,
-            });
-        }
+    /// The engine loop. One context, one batch, and one decode per step across
+    /// every slot that has work: the weights are read once and every sequence
+    /// in the batch rides along on that read, which is the whole point.
+    fn serve(
+        &self,
+        mut jobs: mpsc::Receiver<Job>,
+        ready: std::sync::mpsc::Sender<Result<ModelInfo>>,
+        inflight: Arc<AtomicUsize>,
+    ) {
+        // Context is per slot, so the shared window is the sum. A prefill may
+        // be as long as one slot's window, so the batch has to hold that many
+        // tokens even though a decode step only needs one per slot.
+        let total_ctx = self.n_ctx.saturating_mul(self.max_inflight);
+        let params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(total_ctx))
+            .with_n_seq_max(self.max_inflight)
+            .with_n_batch(self.n_ctx.max(512));
 
-        // A fresh context per request keeps this single-slot version honest:
-        // no KV state survives between requests. Multi-slot will hold one
-        // context and partition it by sequence id instead.
-        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(self.n_ctx));
-        let mut ctx = self
+        let mut ctx = match self
             .model
-            .new_context(self.backend, ctx_params)
-            .context("failed to create the llama context")?;
-
-        let prompt = self.build_prompt(&job.request)?;
-        let tokens = self
-            .model
-            .str_to_token(&prompt, AddBos::Always)
-            .context("failed to tokenize the prompt")?;
-
-        // A prompt that does not fit cannot be decoded at all, and the error
-        // llama.cpp gives for it says nothing about why.
-        anyhow::ensure!(
-            (tokens.len() as u32) < self.n_ctx,
-            "prompt is {} tokens and the context is {}",
-            tokens.len(),
-            self.n_ctx
-        );
-
-        let prefill = info_span!("prefill", prompt_tokens = tokens.len()).entered();
-        let started = ggml_time_us();
-        let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
-        let last = tokens.len() as i32 - 1;
-        for (i, token) in (0i32..).zip(tokens.iter().copied()) {
-            batch.add(token, i, &[0], i == last)?;
-        }
-        ctx.decode(&mut batch).context("prompt decode failed")?;
-        let prefill_s = (ggml_time_us() - started) as f64 / 1e6;
-        info!(
-            elapsed_ms = (prefill_s * 1e3) as u64,
-            tok_per_sec = tokens.len() as f64 / prefill_s,
-            "prompt ingested"
-        );
-        drop(prefill);
-
-        let mut sampler = if job.request.temperature > 0.0 {
-            LlamaSampler::chain_simple([
-                LlamaSampler::temp(job.request.temperature),
-                LlamaSampler::top_p(job.request.top_p, 1),
-                LlamaSampler::dist(job.request.seed),
-            ])
-        } else {
-            LlamaSampler::chain_simple([LlamaSampler::greedy()])
+            .new_context(self.backend, params)
+            .context("failed to create the llama context")
+        {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                let _ = ready.send(Err(err));
+                return;
+            }
         };
 
-        // A token is a byte sequence, not a character, so a multi-byte
-        // character can straddle two tokens. The incremental decoder holds the
-        // partial bytes until they form one.
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut n_cur = batch.n_tokens();
-        // Decoding past the context window fails inside llama.cpp with a
-        // memory-slot error, mid-sentence. Stop at the edge and say so.
-        let room = self.n_ctx as i32 - n_cur;
-        let n_limit = n_cur + job.request.max_tokens.min(room);
-        let context_bound = job.request.max_tokens > room;
-        let mut n_decoded: u32 = 0;
+        if ready.send(Ok(self.info.clone())).is_err() {
+            return; // Caller gave up while we were loading.
+        }
+        info!(
+            slots = self.max_inflight,
+            slot_ctx = self.n_ctx,
+            total_ctx,
+            "engine ready"
+        );
 
-        let generate = info_span!("generate", max_tokens = job.request.max_tokens).entered();
-        let started = ggml_time_us();
-        let mut stop = if context_bound { Stop::ContextFull } else { Stop::Limit };
+        let mut batch = LlamaBatch::new(self.n_ctx.max(512) as usize, self.max_inflight as i32);
+        let mut slots: Vec<Option<Slot>> = (0..self.max_inflight).map(|_| None).collect();
+        // Terminal events for slots that have already given back their
+        // sequence. Kept here so a caller that stopped reading cannot delay
+        // the engine, only its own last message.
+        let mut outbox: Vec<(mpsc::Sender<Event>, Event)> = Vec::new();
+        let mut closed = false;
 
-        while n_cur < n_limit {
+        loop {
+            outbox.retain(|(events, event)| {
+                matches!(events.try_send(event.clone()), Err(mpsc::error::TrySendError::Full(_)))
+            });
+
+            for index in 0..slots.len() {
+                if let Some(slot) = slots[index].as_mut()
+                    && matches!(slot.flush(), Flush::Abandoned)
+                {
+                    warn!(seq_id = slot.seq_id, "caller stopped reading");
+                    self.retire(&mut ctx, &mut slots, index, &inflight, &mut outbox, Stop::Cancelled);
+                }
+            }
+
+            closed |= self.admit(&mut ctx, &mut slots, &mut jobs, &inflight, &mut outbox, &mut batch);
+
+            let active = slots.iter().flatten().count();
+            if closed && active == 0 && outbox.is_empty() {
+                break;
+            }
+
+            match self.step(&mut ctx, &mut slots, &inflight, &mut outbox, &mut batch) {
+                Step::Decoded => {}
+                // Nothing could be decoded: every slot is waiting on its
+                // caller, or there is no work at all and only the outbox is
+                // keeping us here.
+                Step::Idle => std::thread::sleep(IDLE_TICK),
+            }
+        }
+    }
+
+    /// Fill free slots from the queue. Returns whether the queue has closed.
+    ///
+    /// Blocks only when there is nothing else to do: with work in flight a
+    /// request that has not arrived yet must not delay the ones that have.
+    fn admit(
+        &self,
+        ctx: &mut LlamaContext,
+        slots: &mut [Option<Slot>],
+        jobs: &mut mpsc::Receiver<Job>,
+        inflight: &Arc<AtomicUsize>,
+        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
+        batch: &mut LlamaBatch,
+    ) -> bool {
+        loop {
+            let Some(index) = slots.iter().position(Option::is_none) else {
+                return false;
+            };
+            let idle = slots.iter().all(Option::is_none) && outbox.is_empty();
+
+            let job = if idle {
+                match jobs.blocking_recv() {
+                    Some(job) => job,
+                    None => return true,
+                }
+            } else {
+                match jobs.try_recv() {
+                    Ok(job) => job,
+                    Err(mpsc::error::TryRecvError::Empty) => return false,
+                    Err(mpsc::error::TryRecvError::Disconnected) => return true,
+                }
+            };
+
             if job.cancel.load(Ordering::Acquire) {
-                stop = Stop::Cancelled;
-                break;
+                // Cancelled while queued: never touch the GPU for it.
+                inflight.fetch_sub(1, Ordering::AcqRel);
+                outbox.push((
+                    job.events.clone(),
+                    Event::Done {
+                        stop: Stop::Cancelled,
+                        prompt_tokens: 0,
+                        tokens: 0,
+                        elapsed_ms: 0,
+                    },
+                ));
+                continue;
             }
 
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-
-            if self.model.is_eog_token(token) {
-                stop = Stop::EndOfGeneration;
-                break;
+            let seq_id = index as u32;
+            match self.prefill(ctx, batch, job, seq_id) {
+                Ok(Admitted::Running(slot)) => slots[index] = Some(slot),
+                Ok(Admitted::Finished { job, stop, prompt_tokens, elapsed_ms }) => {
+                    inflight.fetch_sub(1, Ordering::AcqRel);
+                    let _ = ctx.clear_kv_cache_seq(Some(seq_id), None, None);
+                    outbox.push((
+                        job.events.clone(),
+                        Event::Done { stop, prompt_tokens, tokens: 0, elapsed_ms },
+                    ));
+                }
+                Err((job, err)) => {
+                    warn!(error = %err, "generation failed");
+                    inflight.fetch_sub(1, Ordering::AcqRel);
+                    let _ = ctx.clear_kv_cache_seq(Some(seq_id), None, None);
+                    outbox.push((job.events.clone(), Event::Failed(err.to_string())));
+                }
             }
+        }
+    }
 
-            let piece = self.model.token_to_piece(token, &mut decoder, false, None)?;
-            trace!(token = token.0, %piece, "token");
-            if job.events.blocking_send(Event::Token(piece)).is_err() {
-                // Receiver gone. Drop sets the cancel flag too, but a closed
-                // channel is the earlier and more direct signal.
-                stop = Stop::Cancelled;
-                break;
+    /// Ingest a prompt and sample its first token, which is the one thing that
+    /// cannot ride along with the other slots: a prefill is many tokens where a
+    /// decode step is one. Every running slot waits out this decode.
+    #[allow(clippy::type_complexity)]
+    fn prefill(
+        &self,
+        ctx: &mut LlamaContext,
+        batch: &mut LlamaBatch,
+        job: Job,
+        seq_id: u32,
+    ) -> std::result::Result<Admitted, (Job, anyhow::Error)> {
+        let started = ggml_time_us();
+        let prepared = (|| -> Result<(Vec<LlamaToken>, LlamaSampler)> {
+            let prompt = self.build_prompt(&job.request)?;
+            let tokens = self
+                .model
+                .str_to_token(&prompt, AddBos::Always)
+                .context("failed to tokenize the prompt")?;
+            anyhow::ensure!(
+                (tokens.len() as u32) < self.n_ctx,
+                "prompt is {} tokens and a slot's context is {}",
+                tokens.len(),
+                self.n_ctx
+            );
+            let sampler = if job.request.temperature > 0.0 {
+                LlamaSampler::chain_simple([
+                    LlamaSampler::temp(job.request.temperature),
+                    LlamaSampler::top_p(job.request.top_p, 1),
+                    LlamaSampler::dist(job.request.seed),
+                ])
+            } else {
+                LlamaSampler::chain_simple([LlamaSampler::greedy()])
+            };
+            Ok((tokens, sampler))
+        })();
+
+        let (tokens, mut sampler) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => return Err((job, err)),
+        };
+
+        batch.clear();
+        let last = tokens.len() as i32 - 1;
+        for (position, token) in (0i32..).zip(tokens.iter().copied()) {
+            if let Err(err) = batch.add(token, position, &[seq_id as i32], position == last) {
+                return Err((job, err.into()));
             }
-
-            batch.clear();
-            batch.add(token, n_cur, &[0], true)?;
-            n_cur += 1;
-            n_decoded += 1;
-
-            ctx.decode(&mut batch).context("decode failed")?;
+        }
+        if let Err(err) = ctx.decode(batch).context("prompt decode failed") {
+            return Err((job, err));
         }
 
         let elapsed = (ggml_time_us() - started) as f64 / 1e6;
         info!(
-            tokens = n_decoded,
+            seq_id,
+            prompt_tokens = tokens.len(),
             elapsed_ms = (elapsed * 1e3) as u64,
-            tok_per_sec = f64::from(n_decoded) / elapsed.max(f64::EPSILON),
+            tok_per_sec = tokens.len() as f64 / elapsed.max(f64::EPSILON),
+            "prompt ingested"
+        );
+
+        let token = sampler.sample(ctx, last);
+        sampler.accept(token);
+
+        let prompt_tokens = tokens.len() as u32;
+        let room = self.n_ctx - prompt_tokens;
+        let asked = job.request.max_tokens.max(0) as u32;
+        let budget = asked.min(room);
+
+        if self.model.is_eog_token(token) || budget == 0 {
+            let stop = if self.model.is_eog_token(token) {
+                Stop::EndOfGeneration
+            } else {
+                Stop::ContextFull
+            };
+            return Ok(Admitted::Finished {
+                job,
+                stop,
+                prompt_tokens,
+                elapsed_ms: (elapsed * 1e3) as u64,
+            });
+        }
+
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        let piece = match self.model.token_to_piece(token, &mut decoder, false, None) {
+            Ok(piece) => piece,
+            Err(err) => return Err((job, err.into())),
+        };
+
+        Ok(Admitted::Running(Slot {
+            job,
+            sampler,
+            decoder,
+            seq_id,
+            n_cur: prompt_tokens as i32,
+            next_input: token,
+            prompt_tokens,
+            n_decoded: 1,
+            budget,
+            context_bound: asked > room,
+            started_us: ggml_time_us(),
+            pending: Some(Event::Token(piece)),
+            stalled_since: None,
+        }))
+    }
+
+    /// One decode across every slot that is ready, then one token each.
+    fn step(
+        &self,
+        ctx: &mut LlamaContext,
+        slots: &mut [Option<Slot>],
+        inflight: &Arc<AtomicUsize>,
+        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
+        batch: &mut LlamaBatch,
+    ) -> Step {
+        batch.clear();
+        let mut rows: Vec<(usize, i32)> = Vec::new();
+
+        for index in 0..slots.len() {
+            let Some(slot) = slots[index].as_mut() else {
+                continue;
+            };
+            if slot.cancelled() {
+                self.retire(ctx, slots, index, inflight, outbox, Stop::Cancelled);
+                continue;
+            }
+            if slot.pending.is_some() {
+                continue; // Waiting on its caller, not on the GPU.
+            }
+
+            let row = batch.n_tokens();
+            if let Err(err) = batch.add(slot.next_input, slot.n_cur, &[slot.seq_id as i32], true) {
+                let message = err.to_string();
+                self.fail(ctx, slots, index, inflight, outbox, message);
+                continue;
+            }
+            rows.push((index, row));
+        }
+
+        if rows.is_empty() {
+            return Step::Idle;
+        }
+
+        let enqueued = ggml_time_us();
+        let decoded = ctx.decode(batch).context("decode failed");
+        let enqueue_us = ggml_time_us() - enqueued;
+        if let Err(err) = decoded {
+            // The batch is shared, so a failed decode belongs to every slot in
+            // it. None of them can be trusted to continue.
+            let message = err.to_string();
+            for (index, _) in rows {
+                self.fail(ctx, slots, index, inflight, outbox, message.clone());
+            }
+            return Step::Decoded;
+        }
+
+        let mut gpu_us = 0i64;
+        let mut sampled = 0;
+        for (index, row) in rows {
+            let Some(slot) = slots[index].as_mut() else {
+                continue;
+            };
+            slot.n_cur += 1;
+
+            // Metal runs `decode` asynchronously, so the enqueue above returns
+            // long before the work is done and the first read of the logits is
+            // what waits for it. Timing that read is how the GPU's real cost
+            // shows up; the samples after it are pure CPU.
+            let started = ggml_time_us();
+            let token = slot.sampler.sample(ctx, row);
+            if sampled == 0 {
+                gpu_us = ggml_time_us() - started;
+            }
+            sampled += 1;
+            slot.sampler.accept(token);
+
+            if self.model.is_eog_token(token) {
+                self.retire(ctx, slots, index, inflight, outbox, Stop::EndOfGeneration);
+                continue;
+            }
+
+            let piece = match self.model.token_to_piece(token, &mut slot.decoder, false, None) {
+                Ok(piece) => piece,
+                Err(err) => {
+                    let message = err.to_string();
+                    self.fail(ctx, slots, index, inflight, outbox, message);
+                    continue;
+                }
+            };
+            trace!(seq_id = slot.seq_id, token = token.0, %piece, "token");
+
+            slot.next_input = token;
+            slot.n_decoded += 1;
+            slot.pending = Some(Event::Token(piece));
+
+            if slot.n_decoded >= slot.budget {
+                let stop = if slot.context_bound { Stop::ContextFull } else { Stop::Limit };
+                // The slot keeps its pending piece: `retire` hands both it and
+                // the terminal event to the outbox, in order.
+                self.retire(ctx, slots, index, inflight, outbox, stop);
+            }
+        }
+
+        debug!(slots = sampled, enqueue_us, gpu_us, "step");
+        Step::Decoded
+    }
+
+    /// Give back a slot's sequence and tell its caller why.
+    ///
+    /// The sequence and the count are released before the terminal event goes
+    /// out, so a caller that reads `capacity()` on seeing it never sees a slot
+    /// that is finished but still counted.
+    fn retire(
+        &self,
+        ctx: &mut LlamaContext,
+        slots: &mut [Option<Slot>],
+        index: usize,
+        inflight: &Arc<AtomicUsize>,
+        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
+        stop: Stop,
+    ) {
+        let Some(slot) = slots[index].take() else {
+            return;
+        };
+        let elapsed_ms = slot.elapsed_ms();
+        let _ = ctx.clear_kv_cache_seq(Some(slot.seq_id), None, None);
+        inflight.fetch_sub(1, Ordering::AcqRel);
+
+        info!(
+            seq_id = slot.seq_id,
+            tokens = slot.n_decoded,
+            prompt_tokens = slot.prompt_tokens,
+            elapsed_ms,
+            tok_per_sec = f64::from(slot.n_decoded) / (elapsed_ms.max(1) as f64 / 1e3),
             ?stop,
             "generation complete"
         );
-        drop(generate);
 
-        // The context is dropped here, releasing its KV cache. For a cancelled
-        // request that is the whole of the cleanup; multi-slot will call
-        // kv_cache_seq_rm on the slot instead.
-        Ok(Outcome {
-            stop,
-            prompt_tokens: tokens.len() as u32,
-            tokens: n_decoded,
-            elapsed_ms: (elapsed * 1e3) as u64,
-        })
+        if let Some(pending) = slot.pending {
+            outbox.push((slot.job.events.clone(), pending));
+        }
+        outbox.push((
+            slot.job.events.clone(),
+            Event::Done {
+                stop,
+                prompt_tokens: slot.prompt_tokens,
+                tokens: slot.n_decoded,
+                elapsed_ms,
+            },
+        ));
+    }
+
+    fn fail(
+        &self,
+        ctx: &mut LlamaContext,
+        slots: &mut [Option<Slot>],
+        index: usize,
+        inflight: &Arc<AtomicUsize>,
+        outbox: &mut Vec<(mpsc::Sender<Event>, Event)>,
+        error: String,
+    ) {
+        let Some(slot) = slots[index].take() else {
+            return;
+        };
+        warn!(seq_id = slot.seq_id, %error, "generation failed");
+        let _ = ctx.clear_kv_cache_seq(Some(slot.seq_id), None, None);
+        inflight.fetch_sub(1, Ordering::AcqRel);
+        outbox.push((slot.job.events.clone(), Event::Failed(error)));
     }
 
     fn build_prompt(&self, request: &GenerateRequest) -> Result<String> {
@@ -590,4 +938,15 @@ impl Runtime {
         trace!(%prompt, "templated prompt");
         Ok(prompt)
     }
+}
+
+/// What admitting a job produced: a running slot, or an answer already.
+enum Admitted {
+    Running(Slot),
+    Finished { job: Job, stop: Stop, prompt_tokens: u32, elapsed_ms: u64 },
+}
+
+enum Step {
+    Decoded,
+    Idle,
 }

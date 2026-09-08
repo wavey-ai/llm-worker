@@ -120,18 +120,57 @@ wall 5s · 256 tokens · 51.2 tok/s across all requests
 engine inflight while running: max 1 of 1
 ```
 
-Read it as the baseline it is. Time to first byte climbs in one-generation
-steps because each request waits for the slot; each generation runs at full
-speed once it has it; and aggregate throughput is the same 52 tok/s a single
-stream gets. The GPU is doing one sequence's work no matter how many clients
-are waiting, which is what the multi-slot loop is for.
+Time to first byte is the tell. With one slot it climbs in one-generation
+steps, because each request is waiting for the slot rather than for the GPU.
+
+### What batching buys, measured
+
+An M1 Air, Qwen3.5-0.8B Q4_K_M, eight clients at once:
+
+| slots | aggregate | time to first byte |
+|-------|-----------|--------------------|
+| 1     | 51.8 tok/s | 0.01s → 4.3s, in steps |
+| 2     | 57.4 tok/s | |
+| 4     | 86.5 tok/s | |
+| 8     | 88.9 tok/s | ~0.01s, all of them |
+| 16 slots, 16 clients | 109.8 tok/s | |
+
+A lone client is unaffected by the slot count: 50.3 tok/s at one slot, 51.5 at
+eight. Nobody pays for capacity they are not using.
+
+The latency win is unambiguous — everyone starts at once instead of queueing.
+The throughput win is real but smaller than the theory says it should be, and
+`llm_engine=debug` says where it goes:
+
+```
+step slots=8 enqueue_us=1043 gpu_us=79214
+```
+
+Metal runs `decode` asynchronously, so the enqueue returns in 1ms and the
+first read of the logits waits for the GPU. That wait is 79ms for a batch of
+eight, against ~19ms for a batch of one — so each extra sequence costs about
+half a full forward pass instead of nearly nothing. Everything outside the GPU
+— sampling, detokenizing, handing tokens to callers — is 2% of a step.
+
+Two suspects ruled out and one still open. It is not the engine loop, which is
+that 2%. It is not `kv_unified`, which llama.cpp defaults to false: forcing it
+true changed nothing. What remains is the model. `arch = qwen35` is a hybrid —
+only 6 of its 24 layers keep a KV cache, the other 18 are linear-attention
+layers carrying recurrent state per sequence, and per-sequence state does not
+amortise across a batch the way shared weights do. The same GPU batches 23
+tokens of one sequence at 0.4ms each during prefill and 8 tokens of eight
+sequences at 9.9ms each during decode. Confirming that needs a dense
+transformer of similar size to compare against.
 
 ### Capacity
 
 `--max-inflight` sizes the engine, and the engine's `capacity()` is what the
-ring hears in its heartbeat — one number, not two. It is 1 while the engine
-is single-slot: a second request then waits in the ring, where a scheduler
-can see it, rather than inside the engine, where it cannot.
+ring hears in its heartbeat — one number, not two. Requests beyond that queue
+inside the engine and still count as occupancy, so a scheduler reading
+`available_slots` is never told there is room that does not exist.
+
+`--ctx-size` is **per slot**. Eight slots at 4096 is a 32768-token context,
+and the KV memory to match.
 
 The example runs the public listener only. A worker on another machine reaches
 a ring through its private mutually-authenticated control listener, which the
