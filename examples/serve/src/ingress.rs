@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{Method, Request, StatusCode};
-use llmq::Engine;
+use llm_engine::Engine;
 use upload_response::UploadResponseRouter;
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
@@ -47,7 +47,7 @@ impl AppRouter {
     fn not_found() -> HandlerResponse {
         Self::json(
             StatusCode::NOT_FOUND,
-            llmq_worker::protocol::error_body("not found", "invalid_request_error"),
+            llm_worker::protocol::error_body("not found", "invalid_request_error"),
         )
     }
 
@@ -80,7 +80,7 @@ impl AppRouter {
                 "data": [{
                     "id": self.model_name,
                     "object": "model",
-                    "owned_by": "llmq",
+                    "owned_by": "llm",
                 }],
             })
             .to_string(),

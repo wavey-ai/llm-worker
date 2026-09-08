@@ -8,11 +8,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use llmq::{GenerateRequest, Message, Stop};
+use llm_engine::{GenerateRequest, Message, Stop};
 use serde::{Deserialize, Serialize};
 
 /// Reported back as the model name when a request does not name one.
-pub const DEFAULT_MODEL: &str = "llmq";
+pub const DEFAULT_MODEL: &str = "llm";
 
 pub const SSE_CONTENT_TYPE: &str = "text/event-stream; charset=utf-8";
 pub const JSON_CONTENT_TYPE: &str = "application/json";

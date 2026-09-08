@@ -1,15 +1,15 @@
 [package]
-name = "llmq"
+name = "llm-engine"
 description = "Local LLM inference engine. Owns the model; knows nothing of HTTP."
 version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "llmq"
+name = "llm_engine"
 path = "src/lib.rs"
 
 [[bin]]
-name = "llmq"
+name = "llm-engine"
 path = "src/main.rs"
 
 [dependencies]

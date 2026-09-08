@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use llmq::{Engine, EngineConfig, Event, GenerateRequest, Stop};
+use llm_engine::{Engine, EngineConfig, Event, GenerateRequest, Stop};
 
 /// Shared across tests: model load dominates runtime, so keep it to one.
 fn engine() -> Engine {
@@ -22,7 +22,7 @@ fn ask(prompt: &str, max_tokens: i32) -> GenerateRequest {
 }
 
 /// Drain a generation, returning the text and why it stopped.
-async fn drain(generation: &mut llmq::Generation) -> (String, Stop) {
+async fn drain(generation: &mut llm_engine::Generation) -> (String, Stop) {
     let mut text = String::new();
     while let Some(event) = generation.recv().await {
         match event {

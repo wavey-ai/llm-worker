@@ -238,7 +238,7 @@ impl Engine {
 
         let thread_inflight = inflight.clone();
         let thread = std::thread::Builder::new()
-            .name("llmq-engine".to_string())
+            .name("llm-engine".to_string())
             .spawn(move || engine_thread(config, jobs_rx, ready_tx, thread_inflight))
             .context("failed to start the engine thread")?;
 

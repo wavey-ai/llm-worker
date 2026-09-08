@@ -1,19 +1,19 @@
 [package]
-name = "llmq-worker"
-description = "Serves llmq over the upload-response ring. No listening socket of its own."
+name = "llm-worker"
+description = "Serves llm-engine over the upload-response ring. No listening socket of its own."
 version.workspace = true
 edition.workspace = true
 
 [lib]
-name = "llmq_worker"
+name = "llm_worker"
 path = "src/lib.rs"
 
 [[bin]]
-name = "llmq-worker"
+name = "llm-worker"
 path = "src/main.rs"
 
 [dependencies]
-llmq = { path = "../llmq" }
+llm-engine = { path = "../llm-engine" }
 
 anyhow.workspace = true
 clap.workspace = true

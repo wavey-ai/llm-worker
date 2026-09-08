@@ -1754,7 +1754,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "llmq"
+name = "llm-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1768,7 +1768,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "llmq-serve"
+name = "llm-serve"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1780,8 +1780,8 @@ dependencies = [
  "clap",
  "futures-util",
  "http",
- "llmq",
- "llmq-worker",
+ "llm-engine",
+ "llm-worker",
  "serde_json",
  "tokio",
  "tracing",
@@ -1789,7 +1789,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "llmq-worker"
+name = "llm-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1799,7 +1799,7 @@ dependencies = [
  "clap",
  "gpu-worker",
  "http",
- "llmq",
+ "llm-engine",
  "serde",
  "serde_json",
  "tokio",

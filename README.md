@@ -1,10 +1,10 @@
-# llmq
+# llm-worker
 
 Local LLM inference, and a worker that serves it over HTTP.
 
 ```
-llmq/            the engine. Owns the model, the context, sampling. No HTTP.
-llmq-worker/     the adapter. Claims work from the upload-response ring and
+llm-engine/            the engine. Owns the model, the context, sampling. No HTTP.
+llm-worker/     the adapter. Claims work from the upload-response ring and
                  answers it in the OpenAI chat-completions format.
 examples/serve/  an ingress, for trying it out without a second service.
 ```
@@ -40,8 +40,8 @@ generation, but only after prefill finishes for a long prompt.
 There is a CLI over the same interface a worker uses:
 
 ```
-cargo run -p llmq -- --prompt "Say hi." --max-tokens 64
-cargo run -p llmq -- --model models/model.gguf --system "Be brief." --think
+cargo run -p llm-engine -- --prompt "Say hi." --max-tokens 64
+cargo run -p llm-engine -- --model models/model.gguf --system "Be brief." --think
 ```
 
 ## The worker
@@ -52,7 +52,7 @@ ring, claiming request lanes and streaming tokens back down response lanes.
 The GPU is here; the front door is elsewhere:
 
 ```
-llmq-worker \
+llm-worker \
   --model models/Qwen3.5-0.8B-Q4_K_M.gguf \
   --ingress-url https://ingress-a:8443 \
   --ingress-url https://ingress-b:8443
@@ -65,7 +65,7 @@ process, over an in-process ring, so one binary is enough to try the thing
 out. Everything the server crate touches lives there.
 
 ```
-cargo run -p llmq-serve -- \
+cargo run -p llm-serve -- \
   --model models/Qwen3.5-0.8B-Q4_K_M.gguf \
   --tls-cert cert.pem --tls-key key.pem
 ```

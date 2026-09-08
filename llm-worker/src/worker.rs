@@ -1,4 +1,4 @@
-//! The worker: one llmq engine, serving whatever the ring hands it.
+//! The worker: one engine, serving whatever the ring hands it.
 //!
 //! The ring gives out jobs two ways — from an in-process service, or over
 //! HTTP from a remote ingress — and the two job types differ only in how a
@@ -18,7 +18,7 @@ use gpu_worker::upload_response::{
     run_remote_worker_loop,
 };
 use http::{Request, StatusCode};
-use llmq::{Engine, Event};
+use llm_engine::{Engine, Event};
 use tokio::time::timeout;
 use tracing::{Instrument, debug, info, info_span, warn};
 use upload_response::{RemoteIngressClient, ResponseCacheWriter, UploadResponseService};

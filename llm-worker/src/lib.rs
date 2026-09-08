@@ -1,4 +1,4 @@
-//! llmq on the upload-response ring.
+//! The engine on the upload-response ring.
 //!
 //! [`worker`] is the engine's adapter: it claims a request lane, generates,
 //! and writes tokens to the response lane. [`protocol`] is the only part that

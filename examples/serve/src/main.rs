@@ -1,11 +1,11 @@
-//! llmq-serve: the front door and the worker in one process.
+//! llm-serve: the front door and the worker in one process.
 //!
-//! `llmq-worker` has no listening socket — it attaches to an ingress that
+//! `llm-worker` has no listening socket — it attaches to an ingress that
 //! already exists. This example is that ingress, running an in-process ring
 //! so one binary is enough to try the thing out:
 //!
 //! ```text
-//! llmq-serve --model models/model.gguf --tls-cert cert.pem --tls-key key.pem
+//! llm-serve --model models/model.gguf --tls-cert cert.pem --tls-key key.pem
 //! ```
 //!
 //! Everything the server crate touches lives here rather than in the worker
@@ -19,23 +19,23 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::Parser;
-use llmq::{Engine, EngineConfig, ModelSource};
+use llm_engine::{Engine, EngineConfig, ModelSource};
 use tokio::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use upload_response::{UploadResponseConfig, UploadResponseRouter, UploadResponseService};
 use web_service::{H2H3Server, Server, ServerBuilder};
 
-use llmq_worker::protocol::DEFAULT_MODEL;
-use llmq_worker::worker::{LlmWorker, WorkerConfig};
+use llm_worker::protocol::DEFAULT_MODEL;
+use llm_worker::worker::{LlmWorker, WorkerConfig};
 
-use llmq_serve::ingress::AppRouter;
+use llm_serve::ingress::AppRouter;
 
 const HF_REPO: &str = "unsloth/Qwen3.5-0.8B-GGUF";
 const HF_FILE: &str = "Qwen3.5-0.8B-Q4_K_M.gguf";
 
 const DEFAULT_FILTER: &str =
-    "llmq=info,llmq_worker=info,llmq_serve=info,gpu_worker_upload_response=info,llama-cpp-2=warn";
+    "llm_engine=info,llm_worker=info,llm_serve=info,gpu_worker_upload_response=info,llama-cpp-2=warn";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
 
     let service = Arc::new(UploadResponseService::new(UploadResponseConfig::default()));
 
-    let mut config = WorkerConfig::new(format!("llmq-{}", std::process::id()));
+    let mut config = WorkerConfig::new(format!("llm-{}", std::process::id()));
     config.max_inflight = engine.capacity().max_inflight;
     config.poll_interval = Duration::from_millis(10);
     config.model_name = args.model_name.clone();

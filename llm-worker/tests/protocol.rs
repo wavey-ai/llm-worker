@@ -1,7 +1,7 @@
 //! The wire format, tested without a model or a socket.
 
-use llmq_worker::protocol::{ChatRequest, RequestDefaults, ResponseWriter, Usage};
-use llmq::Stop;
+use llm_worker::protocol::{ChatRequest, RequestDefaults, ResponseWriter, Usage};
+use llm_engine::Stop;
 
 fn parse(json: &str) -> ChatRequest {
     ChatRequest::parse(json.as_bytes()).expect("request should parse")

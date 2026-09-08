@@ -1,5 +1,5 @@
 [workspace]
-members = ["llmq", "llmq-worker", "examples/serve"]
+members = ["llm-engine", "llm-worker", "examples/serve"]
 resolver = "3"
 
 [workspace.package]

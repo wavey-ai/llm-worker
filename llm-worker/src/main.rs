@@ -1,4 +1,4 @@
-//! llmq-worker: an llmq engine attached to the upload-response ring.
+//! llm-worker: an engine attached to the upload-response ring.
 //!
 //! The GPU sits here; the front door is somewhere else. This process holds no
 //! listening socket — it discovers ingress services, claims request lanes over
@@ -11,20 +11,20 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use llmq::{Engine, EngineConfig, ModelSource};
+use llm_engine::{Engine, EngineConfig, ModelSource};
 use tokio::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use upload_response::{RemoteIngressClient, UploadResponseConfig};
 
-use llmq_worker::protocol::{DEFAULT_MODEL, RequestDefaults};
-use llmq_worker::worker::{LlmWorker, WorkerConfig};
+use llm_worker::protocol::{DEFAULT_MODEL, RequestDefaults};
+use llm_worker::worker::{LlmWorker, WorkerConfig};
 
 const HF_REPO: &str = "unsloth/Qwen3.5-0.8B-GGUF";
 const HF_FILE: &str = "Qwen3.5-0.8B-Q4_K_M.gguf";
 
 const DEFAULT_FILTER: &str =
-    "llmq=info,llmq_worker=info,gpu_worker_upload_response=info,llama-cpp-2=warn";
+    "llm_engine=info,llm_worker=info,gpu_worker_upload_response=info,llama-cpp-2=warn";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
     let worker_id = args
         .worker_id
         .clone()
-        .unwrap_or_else(|| format!("llmq-{}", std::process::id()));
+        .unwrap_or_else(|| format!("llm-{}", std::process::id()));
 
     let worker = Arc::new(LlmWorker::new(
         engine.clone(),

@@ -1,21 +1,21 @@
 [package]
-name = "llmq-serve"
-description = "An ingress and an llmq worker in one process, over an in-process ring."
+name = "llm-serve"
+description = "An ingress and a worker in one process, over an in-process ring."
 version.workspace = true
 edition.workspace = true
 publish = false
 
 [lib]
-name = "llmq_serve"
+name = "llm_serve"
 path = "src/lib.rs"
 
 [[bin]]
-name = "llmq-serve"
+name = "llm-serve"
 path = "src/main.rs"
 
 [dependencies]
-llmq = { path = "../../llmq" }
-llmq-worker = { path = "../../llmq-worker" }
+llm-engine = { path = "../../llm-engine" }
+llm-worker = { path = "../../llm-worker" }
 
 anyhow.workspace = true
 clap.workspace = true

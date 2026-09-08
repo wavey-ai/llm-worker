@@ -1,4 +1,4 @@
-//! CLI over the llmq engine. Thin by design: it exercises the same interface a
+//! CLI over the engine. Thin by design: it exercises the same interface a
 //! worker would use, so the library stays honest.
 
 use std::io::Write;
@@ -6,14 +6,14 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use llmq::{Engine, EngineConfig, Event, GenerateRequest, Message, ModelSource, Stop};
+use llm_engine::{Engine, EngineConfig, Event, GenerateRequest, Message, ModelSource, Stop};
 use tracing_subscriber::EnvFilter;
 
 const HF_REPO: &str = "unsloth/Qwen3.5-0.8B-GGUF";
 const HF_FILE: &str = "Qwen3.5-0.8B-Q4_K_M.gguf";
 
 /// llama.cpp is chatty at info, so it starts a level quieter than our own spans.
-const DEFAULT_FILTER: &str = "llmq=info,llama-cpp-2=warn";
+const DEFAULT_FILTER: &str = "llm_engine=info,llama-cpp-2=warn";
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -62,7 +62,7 @@ struct Args {
     #[arg(long)]
     cancel_after: Option<u32>,
 
-    /// Log filter, overriding RUST_LOG. Try `debug`, `llmq=trace` for per-token
+    /// Log filter, overriding RUST_LOG. Try `debug`, `llm_engine=trace` for per-token
     /// events, or `llama-cpp-2=debug` for llama.cpp's own output.
     #[arg(short, long)]
     log: Option<String>,

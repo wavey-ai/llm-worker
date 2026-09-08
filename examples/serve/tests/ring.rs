@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http::{Request, Response, StatusCode};
-use llmq::{Engine, EngineConfig};
-use llmq_serve::ingress::{AppRouter, CHAT_COMPLETIONS_PATH};
-use llmq_worker::worker::{LlmWorker, WorkerConfig};
+use llm_engine::{Engine, EngineConfig};
+use llm_serve::ingress::{AppRouter, CHAT_COMPLETIONS_PATH};
+use llm_worker::worker::{LlmWorker, WorkerConfig};
 use upload_response::{UploadResponseConfig, UploadResponseRouter, UploadResponseService};
 use web_service::{BodyStream, Router, ServerError, StreamWriter};
 
@@ -62,7 +62,7 @@ fn harness() -> AppRouter {
         .expect("engine failed to start");
     let service = Arc::new(UploadResponseService::new(UploadResponseConfig::default()));
 
-    let mut config = WorkerConfig::new("llmq-test");
+    let mut config = WorkerConfig::new("llm-test");
     config.poll_interval = Duration::from_millis(10);
     let worker = Arc::new(LlmWorker::new(engine.clone(), config));
     worker.spawn_local(Arc::clone(&service));
@@ -70,7 +70,7 @@ fn harness() -> AppRouter {
     AppRouter::new(
         Arc::new(UploadResponseRouter::new(service)),
         engine,
-        "llmq-test".to_string(),
+        "llm-test".to_string(),
     )
 }
 
@@ -120,7 +120,7 @@ async fn streams_a_completion_back_through_the_ring() {
     let collected = post(
         &router,
         CHAT_COMPLETIONS_PATH,
-        r#"{"model":"llmq-test","messages":[{"role":"user","content":"Say hi."}],
+        r#"{"model":"llm-test","messages":[{"role":"user","content":"Say hi."}],
             "stream":true,"max_tokens":32,"stream_options":{"include_usage":true}}"#,
     )
     .await;
@@ -205,6 +205,6 @@ async fn serves_health_without_touching_the_ring() {
     let health: serde_json::Value =
         serde_json::from_slice(&response.body.expect("a body")).unwrap();
     assert_eq!(health["status"], "ok");
-    assert_eq!(health["model"], "llmq-test");
+    assert_eq!(health["model"], "llm-test");
     assert_eq!(health["inflight"], 0);
 }
