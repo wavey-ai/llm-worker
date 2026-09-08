@@ -101,6 +101,31 @@ Beyond the standard fields: `think` (or `chat_template_kwargs.enable_thinking`)
 lets the model emit its reasoning block. Unknown fields are ignored rather
 than rejected.
 
+### Load
+
+`examples/serve/load.sh` fires N completions at an ingress at once and reports
+what came back.
+
+```
+N=8 MAX_TOKENS=32 ./examples/serve/load.sh
+
+  #     ttfb    total   tokens    tok/s  finish
+  1  0.013832  0.631942       32     51.8  length
+  2  1.266202  1.869136       32     53.1  length
+  3  0.642347  1.252220       32     52.5  length
+  ...
+  8  4.329184  4.941378       32     52.3  length
+
+wall 5s · 256 tokens · 51.2 tok/s across all requests
+engine inflight while running: max 1 of 1
+```
+
+Read it as the baseline it is. Time to first byte climbs in one-generation
+steps because each request waits for the slot; each generation runs at full
+speed once it has it; and aggregate throughput is the same 52 tok/s a single
+stream gets. The GPU is doing one sequence's work no matter how many clients
+are waiting, which is what the multi-slot loop is for.
+
 ### Capacity
 
 `--max-inflight` sizes the engine, and the engine's `capacity()` is what the

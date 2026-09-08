@@ -2,6 +2,7 @@
 //! router, a worker claims it, and the engine's tokens come back out of the
 //! response lane as they are produced.
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -57,7 +58,8 @@ impl StreamWriter for Collector {
 }
 
 /// One engine, one worker, one router, wired the way `--serve` wires them.
-fn harness() -> AppRouter {
+/// The engine comes back too, for tests that watch occupancy.
+fn harness() -> (AppRouter, Engine) {
     let engine = Engine::spawn(EngineConfig { native_logs: false, ..EngineConfig::default() })
         .expect("engine failed to start");
     let service = Arc::new(UploadResponseService::new(UploadResponseConfig::default()));
@@ -67,11 +69,12 @@ fn harness() -> AppRouter {
     let worker = Arc::new(LlmWorker::new(engine.clone(), config));
     worker.spawn_local(Arc::clone(&service));
 
-    AppRouter::new(
+    let router = AppRouter::new(
         Arc::new(UploadResponseRouter::new(service)),
-        engine,
+        engine.clone(),
         "llm-test".to_string(),
-    )
+    );
+    (router, engine)
 }
 
 async fn post(router: &AppRouter, path: &str, body: &str) -> Collected {
@@ -116,7 +119,7 @@ fn frames(body: &str) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn streams_a_completion_back_through_the_ring() {
-    let router = harness();
+    let (router, _engine) = harness();
     let collected = post(
         &router,
         CHAT_COMPLETIONS_PATH,
@@ -163,7 +166,7 @@ async fn streams_a_completion_back_through_the_ring() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn answers_a_non_streaming_request_with_one_json_body() {
-    let router = harness();
+    let (router, _engine) = harness();
     let collected = post(
         &router,
         CHAT_COMPLETIONS_PATH,
@@ -187,7 +190,7 @@ async fn answers_a_non_streaming_request_with_one_json_body() {
 /// caller, not as a stream that never starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_a_malformed_request() {
-    let router = harness();
+    let (router, _engine) = harness();
     let collected = post(&router, CHAT_COMPLETIONS_PATH, r#"{"messages":[]}"#).await;
 
     assert_eq!(collected.status, Some(StatusCode::BAD_REQUEST));
@@ -195,9 +198,83 @@ async fn rejects_a_malformed_request() {
     assert_eq!(error["error"]["type"], "invalid_request_error");
 }
 
+/// Several clients at once. The engine is single-slot, so this is a queue and
+/// not a batch: the ring parks the waiting requests, the engine never holds
+/// more than its slot count, and every caller still gets a whole answer of
+/// its own. When the multi-slot loop lands, only the bound changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_requests_queue_without_crossing_streams() {
+    const CLIENTS: usize = 4;
+
+    let (router, engine) = harness();
+    let slots = engine.capacity().max_inflight;
+    let router = Arc::new(router);
+
+    // Sampling can miss a peak, so this can only ever understate occupancy —
+    // it will not fail a build for being unlucky.
+    let peak = Arc::new(AtomicUsize::new(0));
+    let watching = Arc::new(AtomicBool::new(true));
+    let sampler = tokio::spawn({
+        let (engine, peak, watching) = (engine.clone(), Arc::clone(&peak), Arc::clone(&watching));
+        async move {
+            while watching.load(Ordering::Relaxed) {
+                peak.fetch_max(engine.capacity().inflight, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    let mut clients = Vec::new();
+    for client in 0..CLIENTS {
+        let router = Arc::clone(&router);
+        clients.push(tokio::spawn(async move {
+            post(
+                &router,
+                CHAT_COMPLETIONS_PATH,
+                &format!(
+                    r#"{{"messages":[{{"role":"user","content":"Say hi, request {client}."}}],
+                        "stream":true,"max_tokens":16}}"#
+                ),
+            )
+            .await
+        }));
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for client in clients {
+        let collected = client.await.expect("a client panicked");
+        assert_eq!(collected.status, Some(StatusCode::OK));
+        assert!(collected.finished);
+
+        let frames = frames(&collected.text());
+        assert_eq!(frames.last().unwrap(), "[DONE]");
+
+        let open: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        let id = open["id"].as_str().expect("a completion id").to_string();
+        assert!(ids.insert(id), "two clients were served the same generation");
+
+        // Every frame in this response must belong to this response.
+        for frame in &frames[..frames.len() - 1] {
+            let chunk: serde_json::Value = serde_json::from_str(frame).unwrap();
+            assert_eq!(chunk["id"], open["id"], "a chunk leaked between streams");
+        }
+    }
+
+    watching.store(false, Ordering::Relaxed);
+    let _ = sampler.await;
+
+    assert_eq!(ids.len(), CLIENTS);
+    assert!(
+        peak.load(Ordering::Relaxed) <= slots,
+        "engine held {} requests with {slots} slot(s): the queue belongs in the ring",
+        peak.load(Ordering::Relaxed)
+    );
+    assert_eq!(engine.capacity().inflight, 0, "a slot was not released");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn serves_the_page_and_health_without_touching_the_ring() {
-    let router = harness();
+    let (router, _engine) = harness();
 
     let request = Request::builder().method("GET").uri("/health").body(()).unwrap();
     let response = router.route(request).await.expect("health should answer");
